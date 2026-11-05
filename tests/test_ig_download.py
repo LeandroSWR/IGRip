@@ -259,6 +259,104 @@ def test_run_download_uses_output_base_and_atomic_log():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_default_log_is_written_inside_collection_folder():
+    d = tempfile.mkdtemp(prefix="igdl_logdir_")
+    try:
+        urlf = os.path.join(d, "urls.txt")
+        with open(urlf, "w", encoding="utf-8") as f:
+            f.write("https://www.instagram.com/p/AAA/\n")
+
+        def fake_dl(url, output_dir, cookies_file, dry_run, filename_template="{shortcode}",
+                    file_index=0, cookies_mode="fallback"):
+            return {"url": url, "shortcode": "AAA", "status": "ok", "author": "x"}
+
+        out = os.path.join(d, "TestDL")
+        with mock.patch.object(ig, "download_url", fake_dl):
+            ig.run_download(urlf, "exercise", output_base=out)
+        log_path = os.path.join(out, "exercise", "exercise.json")
+        assert os.path.isfile(log_path)
+        assert ig.load_log(log_path)["items"][0]["status"] == "ok"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_discover_collections_groups_logs_by_folder():
+    d = tempfile.mkdtemp(prefix="igdl_disc_")
+    try:
+        hair = os.path.join(d, "TestDL", "Haircut")
+        empty = os.path.join(d, "TestDL", "empty")
+        os.makedirs(hair)
+        os.makedirs(empty)
+        ig.save_log({"items": [{"url": "https://example.test/a"}], "summary": {}},
+                    os.path.join(hair, "Haircut.json"))
+        with open(os.path.join(empty, "notes.txt"), "w", encoding="utf-8") as f:
+            f.write("no log")
+        found = ig.discover_collections([d])
+        assert [c["name"] for c in found] == ["Haircut"]
+        assert found[0]["abs_logs"][0].endswith(os.path.join("Haircut", "Haircut.json"))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_path_is_under_rejects_escape():
+    d = tempfile.mkdtemp(prefix="igdl_under_")
+    try:
+        inside = os.path.join(d, "clip.mp4")
+        with open(inside, "w", encoding="utf-8") as f:
+            f.write("x")
+        outside = os.path.abspath(os.path.join(d, "..", "not-here.mp4"))
+        assert ig.path_is_under(inside, [d])
+        assert not ig.path_is_under(outside, [d])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_loose_carousel_files_move_into_post_folder():
+    d = tempfile.mkdtemp(prefix="igdl_carousel_")
+    try:
+        col = os.path.join(d, "Haircut")
+        os.makedirs(col)
+        for name in ("DeVtrD4jYsw_1.jpg", "DeVtrD4jYsw_2.jpg", "DeVtrD4jYsw_10.mp4"):
+            with open(os.path.join(col, name), "w", encoding="utf-8") as f:
+                f.write("x")
+        with open(os.path.join(col, "Video by someone (Db8Zd-2ERAa).mp4"), "w", encoding="utf-8") as f:
+            f.write("reel")
+        ig.save_log({
+            "items": [
+                {"url": "https://www.instagram.com/p/DeVtrD4jYsw/", "shortcode": "DeVtrD4jYsw",
+                 "media_type": "image", "status": "ok",
+                 "saved_path": os.path.join(col, "DeVtrD4jYsw_1.jpg")},
+                {"url": "https://www.instagram.com/reel/Db8Zd-2ERAa/", "shortcode": "Db8Zd-2ERAa",
+                 "media_type": "video", "status": "ok"},
+            ],
+            "summary": {},
+        }, os.path.join(col, "Haircut.json"))
+        moved = ig.regroup_collection_carousels(col)
+        assert list(moved) == ["DeVtrD4jYsw"]
+        folder = os.path.join(col, "DeVtrD4jYsw")
+        assert os.path.isdir(folder)
+        names = sorted(os.listdir(folder))
+        assert names == ["DeVtrD4jYsw_1.jpg", "DeVtrD4jYsw_10.mp4", "DeVtrD4jYsw_2.jpg"]
+        assert os.path.isfile(os.path.join(col, "Video by someone (Db8Zd-2ERAa).mp4"))
+        item = ig.load_log(os.path.join(col, "Haircut.json"))["items"][0]
+        assert item["media_type"] == "carousel"
+        assert item["carousel_count"] == 3
+        assert os.path.basename(item["saved_files"][0]).endswith("_1.jpg")
+        assert os.path.basename(item["saved_files"][1]).endswith("_2.jpg")
+        assert item["saved_path"] == folder
+        video = ig.load_log(os.path.join(col, "Haircut.json"))["items"][1]
+        assert video["media_type"] == "video"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_video_poster_path_stays_out_of_the_media_folder():
+    video = os.path.join("TestDL", "exercise", "clip.mp4")
+    poster = ig.video_poster_path(video)
+    assert os.path.basename(os.path.dirname(poster)) == ".posters"
+    assert poster.endswith(os.path.join(".posters", "clip.mp4.jpg"))
+
+
 def test_run_download_rejects_traversal_collection():
     d = tempfile.mkdtemp(prefix="igdl_trav_")
     try:

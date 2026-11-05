@@ -40,7 +40,8 @@ COOKIE MODES
 
 OPTIONS
   Output folder   Base folder for downloads; each collection is a subfolder.
-  Log file        Where the JSON log is written (default: <collection>.json).
+  Log file        Where the JSON log is written
+                  (default: <output folder>/<collection>/<collection>.json).
   Dry run         Extract metadata only, download nothing.
   Retry failed    Re-attempt URLs that failed in a previous run.
   Filename        Template for output names, e.g. {author}_{shortcode}.
@@ -50,7 +51,7 @@ FEATURES
   - Cookie fallback for age/private posts (cookies stay unused otherwise)
   - Crash-safe JSON logs; a corrupt log is moved aside, never overwritten
   - A key symbol marks downloads that used cookies
-  - Dashboard (ig_dashboard.html) with stats, table and video preview
+  - Dashboard with an Instagram-style grid per collection, plus the log table
   - Log Viewer tab with search, filters and per-entry details
 
 TIPS
@@ -58,7 +59,7 @@ TIPS
   - Keep yt-dlp up to date:  pip install -U yt-dlp
   - Treat cookies.txt like a password: never commit, paste or share it.
 
-Buttons below:  Dashboard opens ig_dashboard.html  -  Output folder opens the
+Buttons below:  Dashboard opens the collection browser  -  Output folder opens the
 download folder  -  Help shows this window.
 """
 
@@ -199,9 +200,9 @@ class IGDownloaderApp:
         ttk.Label(ck_row, text="fallback = cookies only for age/private posts",
                   foreground="gray").grid(row=0, column=1, sticky="w", padx=(8, 0))
 
-        # Auto-link collection → log file
+        # Auto-link collection + output folder → log file inside that collection.
         self._col_var.trace_add("write", self._on_collection_change)
-        # Detect manual logf edits
+        self._out_var.trace_add("write", self._on_collection_change)
         self._logf_var.trace_add("write", self._on_logf_edit)
 
         # Buttons
@@ -260,18 +261,20 @@ class IGDownloaderApp:
         self._log_text.tag_configure("info", foreground="#858585")
         self._log_text.tag_configure("head", foreground="#9cdcfe")
 
+    def _derived_log_path(self):
+        col = self._col_var.get().strip()
+        if not col:
+            return ""
+        out = (self._out_var.get().strip() or "downloads").replace("\\", "/").rstrip("/")
+        return f"{out}/{col}/{col}.json"
+
     def _on_collection_change(self, *_):
-        if self._logf_auto:
-            col = self._col_var.get().strip()
-            self._logf_auto = True  # keep flag while we set it programmatically
-            self._logf_var.set(f"{col}.json" if col else "")
-            self._logf_auto = True  # trace fires on set; re-arm
+        if not self._logf_auto:
+            return
+        self._logf_var.set(self._derived_log_path())
 
     def _on_logf_edit(self, *_):
-        # If value matches collection-derived name, stay in auto mode; else mark manual
-        col = self._col_var.get().strip()
-        derived = f"{col}.json" if col else ""
-        if self._logf_var.get() != derived:
+        if self._logf_var.get() != self._derived_log_path():
             self._logf_auto = False
 
     def _show_template_help(self):
@@ -302,7 +305,14 @@ class IGDownloaderApp:
             messagebox.showerror("Cannot open", f"{path}\n\n{e}")
 
     def _open_dashboard(self):
-        self._open_path(SCRIPT_DIR / "ig_dashboard.html")
+        out = self._out_var.get().strip() or "downloads"
+        if not os.path.isabs(out):
+            out = str(SCRIPT_DIR / out)
+        try:
+            url = ig_download.ensure_dashboard_server(extra_roots=[out])
+            webbrowser.open(url)
+        except OSError as e:
+            messagebox.showerror("Cannot open dashboard", str(e))
 
     def _open_readme(self):
         readme = SCRIPT_DIR / "README.md"
@@ -647,10 +657,12 @@ class IGDownloaderApp:
     # ─────────────────────────────────────────────────────────────────
 
     def _refresh_log_list(self):
-        files = sorted(
-            f.name for f in SCRIPT_DIR.glob("*.json")
-            if f.name != "ig_logs_manifest.json"
-        )
+        out = self._out_var.get().strip() or "downloads"
+        if not os.path.isabs(out):
+            out = str(SCRIPT_DIR / out)
+        files = []
+        for col in ig_download.discover_collections([str(SCRIPT_DIR), out]):
+            files.extend(col["abs_logs"])
         current = self._lv_file_var.get()
         self._lv_combo["values"] = files
         if files and current not in files:

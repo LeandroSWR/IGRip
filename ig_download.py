@@ -23,14 +23,19 @@ private. Override with --cookies-mode always|never.
 
 import argparse
 import json
+import mimetypes
 import os
 import pathlib
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
+import threading
 import time
+import urllib.parse
 from datetime import datetime, timezone
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 try:
     import yt_dlp
@@ -378,7 +383,7 @@ Available template variables
 {index:03d}      Zero-padded index, width 3  →  001, 002, …
 
 The file extension (.mp4, .jpg, …) is always appended automatically.
-For carousel posts the per-slide index (_01, _02, …) is appended before the ext.
+Carousel slides are saved together in a folder named with the post shortcode.
 """
 
 
@@ -423,18 +428,316 @@ def _wait_rate_limit(consecutive, stop_event=None, progress_cb=None):
     return True
 
 
-def update_manifest(log_path):
-    log_dir = os.path.dirname(os.path.abspath(log_path)) or "."
-    manifest_path = os.path.join(log_dir, "ig_logs_manifest.json")
+def collection_log_path(output_base, collection):
+    """JSON log lives inside the collection folder, named after the collection."""
+    return os.path.join(resolve_output_dir(output_base, collection), f"{collection}.json")
+
+
+_SKIP_SCAN_DIRS = {
+    ".git", "__pycache__", ".venv", "venv", "env", "node_modules", ".vscode", ".idea",
+}
+_SKIP_LOG_NAMES = {"ig_logs_manifest.json", "ig_library.json", "ig_dashboard_roots.json"}
+_MAX_COLLECTION_DEPTH = 3
+
+_dashboard_server = None
+_dashboard_lock = threading.Lock()
+
+
+def _is_collection_log_name(name):
+    if not name.endswith(".json"):
+        return False
+    if name in _SKIP_LOG_NAMES or name.endswith(".tmp"):
+        return False
+    if ".corrupt-" in name:
+        return False
+    return True
+
+
+def _looks_like_download_log(path):
     try:
-        files = sorted(
-            f for f in os.listdir(log_dir)
-            if f.endswith(".json") and f != "ig_logs_manifest.json"
-        )
-        with open(manifest_path, "w", encoding="utf-8") as fh:
-            json.dump({"files": files, "updated": datetime.now(timezone.utc).isoformat()}, fh, indent=2)
+        with open(path, "r", encoding="utf-8") as fh:
+            head = fh.read(800)
     except OSError:
-        pass
+        return False
+    return '"items"' in head
+
+
+def path_is_under(path, roots):
+    """True when path resolves inside one of roots. Rejects path traversal."""
+    try:
+        real = os.path.realpath(path)
+    except OSError:
+        return False
+    for root in roots:
+        if not root:
+            continue
+        try:
+            base = os.path.realpath(root)
+        except OSError:
+            continue
+        try:
+            if os.path.commonpath([base, real]) == base:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def discover_collections(roots):
+    """Find collection folders: a directory that holds a download-log JSON.
+
+    Scans each root a few levels down. The collection name is the folder name.
+    The same folder is returned once even if two roots both contain it.
+    """
+    found = {}
+    web_root = os.path.dirname(os.path.abspath(__file__))
+    for root in roots:
+        root = os.path.abspath(root) if root else ""
+        if not root or not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(
+                d for d in dirnames
+                if d not in _SKIP_SCAN_DIRS and not d.startswith(".")
+            )
+            rel = os.path.relpath(dirpath, root)
+            depth = 0 if rel == "." else rel.count(os.sep) + 1
+            if depth > _MAX_COLLECTION_DEPTH:
+                dirnames.clear()
+                continue
+            if os.path.abspath(dirpath) == root:
+                continue
+            logs = []
+            for name in sorted(filenames):
+                if not _is_collection_log_name(name):
+                    continue
+                full = os.path.join(dirpath, name)
+                if _looks_like_download_log(full):
+                    logs.append(full)
+            if not logs:
+                continue
+            key = os.path.abspath(dirpath)
+            hrefs = [_log_href(path, web_root) for path in logs]
+            found[key] = {
+                "name": os.path.basename(dirpath),
+                "dir": os.path.relpath(dirpath, web_root).replace("\\", "/")
+                if path_is_under(dirpath, [web_root])
+                else os.path.abspath(dirpath),
+                "logs": hrefs,
+                "abs_logs": logs,
+            }
+            dirnames.clear()
+    return sorted(found.values(), key=lambda c: c["name"].lower())
+
+
+def _log_href(path, web_root):
+    if path_is_under(path, [web_root]):
+        return os.path.relpath(path, web_root).replace("\\", "/")
+    return "/api/log?path=" + urllib.parse.quote(os.path.abspath(path))
+
+
+def _dashboard_roots_file():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "ig_dashboard_roots.json")
+
+
+def remember_library_roots(extra_roots):
+    """Remember output folders so the dashboard can see collections outside the project."""
+    path = _dashboard_roots_file()
+    current = []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, list):
+            current = [os.path.abspath(p) for p in data if isinstance(p, str)]
+    except (OSError, json.JSONDecodeError):
+        current = []
+    changed = False
+    for root in extra_roots or []:
+        if not root:
+            continue
+        ab = os.path.abspath(root)
+        if ab not in current:
+            current.append(ab)
+            changed = True
+    if changed or not os.path.exists(path):
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(current, fh, indent=2)
+        except OSError:
+            pass
+    return current
+
+
+def library_roots(extra_roots=None):
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    roots = [script_dir]
+    roots.extend(remember_library_roots(extra_roots))
+    for root in extra_roots or []:
+        if root:
+            ab = os.path.abspath(root)
+            if ab not in roots:
+                roots.append(ab)
+    return roots
+
+
+_POSTER_LOCK = threading.Lock()
+_VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".webm"}
+
+
+def video_poster_path(video_path):
+    """Cached still frame, kept out of the media folder so it is not a slide."""
+    folder = os.path.join(os.path.dirname(os.path.abspath(video_path)), ".posters")
+    return os.path.join(folder, os.path.basename(video_path) + ".jpg")
+
+
+def ensure_video_poster(video_path):
+    """Extract one JPEG frame with ffmpeg. Returns the jpeg path, or None."""
+    video_path = os.path.abspath(video_path)
+    if os.path.splitext(video_path)[1].lower() not in _VIDEO_EXTS or not os.path.isfile(video_path):
+        return None
+    dest = video_poster_path(video_path)
+    if os.path.isfile(dest) and os.path.getsize(dest) > 0 and os.path.getmtime(dest) >= os.path.getmtime(video_path):
+        return dest
+    if shutil.which("ffmpeg") is None:
+        return None
+    with _POSTER_LOCK:
+        if os.path.isfile(dest) and os.path.getsize(dest) > 0 and os.path.getmtime(dest) >= os.path.getmtime(video_path):
+            return dest
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        for seek in ("0.5", "0"):
+            cmd = [
+                "ffmpeg", "-y", "-ss", seek, "-i", video_path,
+                "-frames:v", "1", "-vf", "scale=480:-1", "-q:v", "5", dest,
+            ]
+            try:
+                subprocess.run(cmd, capture_output=True, timeout=30, creationflags=flags)
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+            if os.path.isfile(dest) and os.path.getsize(dest) > 0:
+                return dest
+    return None
+
+
+class _DashboardHandler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        server = args[2] if len(args) > 2 else kwargs.get("server")
+        super().__init__(*args, directory=server.web_root, **kwargs)
+
+    def log_message(self, fmt, *args):
+        return
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/collections":
+            self.server.library_roots = library_roots()
+            self._send_json({"collections": discover_collections(self.server.library_roots)})
+            return
+        if parsed.path == "/api/log":
+            self._serve_allowed(parsed.query, kind="log")
+            return
+        if parsed.path == "/api/poster":
+            self._serve_poster(parsed.query)
+            return
+        if parsed.path == "/api/media":
+            raw = urllib.parse.parse_qs(parsed.query).get("path", [""])[0]
+            if raw and path_is_under(raw, [self.server.web_root]):
+                rel = os.path.relpath(os.path.realpath(raw), self.server.web_root)
+                self.path = "/" + "/".join(urllib.parse.quote(part) for part in rel.split(os.sep))
+                return super().do_GET()
+            self._serve_allowed(parsed.query, kind="media")
+            return
+        return super().do_GET()
+
+    def _send_json(self, payload):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_poster(self, query):
+        raw = urllib.parse.parse_qs(query).get("path", [""])[0]
+        if not raw or not path_is_under(raw, self.server.library_roots):
+            self.send_error(403)
+            return
+        poster = ensure_video_poster(os.path.realpath(raw))
+        if not poster:
+            self.send_error(404)
+            return
+        try:
+            with open(poster, "rb") as fh:
+                body = fh.read()
+        except OSError:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_allowed(self, query, kind):
+        raw = urllib.parse.parse_qs(query).get("path", [""])[0]
+        if not raw or not path_is_under(raw, self.server.library_roots):
+            self.send_error(403)
+            return
+        full = os.path.realpath(raw)
+        if not os.path.isfile(full):
+            self.send_error(404)
+            return
+        if kind == "log" and not full.lower().endswith(".json"):
+            self.send_error(403)
+            return
+        ctype = "application/json" if kind == "log" else (mimetypes.guess_type(full)[0] or "application/octet-stream")
+        try:
+            fh = open(full, "rb")
+        except OSError:
+            self.send_error(404)
+            return
+        try:
+            size = os.path.getsize(full)
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(size))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            shutil.copyfileobj(fh, self.wfile)
+        finally:
+            fh.close()
+
+
+def ensure_dashboard_server(extra_roots=None, port=8765):
+    """Serve the dashboard and collection logs on localhost. Returns the page URL."""
+    global _dashboard_server
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    roots = library_roots(extra_roots)
+    with _dashboard_lock:
+        if _dashboard_server is None:
+            httpd = None
+            bind_error = None
+            for candidate in range(port, port + 10):
+                try:
+                    httpd = ThreadingHTTPServer(("127.0.0.1", candidate), _DashboardHandler)
+                    break
+                except OSError as exc:
+                    bind_error = exc
+            if httpd is None:
+                raise bind_error
+            httpd.web_root = script_dir
+            httpd.library_roots = roots
+            thread = threading.Thread(target=httpd.serve_forever, name="ig-dashboard", daemon=True)
+            thread.start()
+            _dashboard_server = httpd
+        else:
+            for root in roots:
+                if root not in _dashboard_server.library_roots:
+                    _dashboard_server.library_roots.append(root)
+        bound = _dashboard_server.server_address[1]
+    return f"http://127.0.0.1:{bound}/ig_dashboard.html"
 
 
 # ---------------------------------------------------------------------------
@@ -488,14 +791,113 @@ def yt_download(url, outtmpl, cookies_file):
         raise RuntimeError(f"yt-dlp download failed with return code {retcode}")
 
 
+def carousel_folder(output_dir, shortcode):
+    """One folder per carousel, named with the post shortcode."""
+    return os.path.join(output_dir, shortcode)
+
+
+_MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".m4v"}
+_LOOSE_SLIDE_RE = re.compile(r"^(?P<code>.+)_(\d+)\.[^.]+$", re.IGNORECASE)
+
+
+def _slide_sort_key(path):
+    name = os.path.basename(path)
+    match = re.search(r"(\d+)(?=\.[^.]+$)", name)
+    return (int(match.group(1)) if match else 0, name.lower())
+
+
+def list_saved_media(directory):
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    files = []
+    for name in names:
+        path = os.path.join(directory, name)
+        if os.path.isfile(path) and os.path.splitext(name)[1].lower() in _MEDIA_EXTS:
+            files.append(path)
+    return sorted(files, key=_slide_sort_key)
+
+
+def settle_slides(output_dir, shortcode, saved):
+    """Keep a multi-slide post inside output_dir/<shortcode>/.
+
+    A single file stays where it was downloaded. Returns (saved_path, files).
+    saved_path is the folder when there is more than one slide.
+    """
+    files = [p for p in (saved or []) if p and os.path.isfile(p)]
+    files = sorted(files, key=_slide_sort_key)
+    if len(files) <= 1:
+        return (files[0] if files else None), files
+    folder = carousel_folder(output_dir, shortcode)
+    os.makedirs(folder, exist_ok=True)
+    moved = []
+    for path in files:
+        dest = os.path.join(folder, os.path.basename(path))
+        if os.path.abspath(path) != os.path.abspath(dest):
+            os.replace(path, dest)
+        moved.append(dest)
+    return folder, moved
+
+
+def group_loose_carousel_files(collection_dir):
+    """Move loose shortcode_1.jpg / shortcode_2.mp4 sets into shortcode folders."""
+    try:
+        names = os.listdir(collection_dir)
+    except OSError:
+        return {}
+    groups = {}
+    for name in names:
+        path = os.path.join(collection_dir, name)
+        if not os.path.isfile(path):
+            continue
+        if os.path.splitext(name)[1].lower() not in _MEDIA_EXTS:
+            continue
+        match = _LOOSE_SLIDE_RE.match(name)
+        if not match:
+            continue
+        groups.setdefault(match.group("code"), []).append(path)
+    moved = {}
+    for code, paths in groups.items():
+        if len(paths) < 2:
+            continue
+        _, files = settle_slides(collection_dir, code, paths)
+        moved[code] = files
+    return moved
+
+
+def regroup_collection_carousels(collection_dir):
+    """Fold existing loose carousel files into post-id folders and update the log."""
+    moved = group_loose_carousel_files(collection_dir)
+    if not moved:
+        return moved
+    name = os.path.basename(os.path.abspath(collection_dir))
+    log_path = os.path.join(collection_dir, f"{name}.json")
+    if not os.path.isfile(log_path):
+        return moved
+    log = load_log(log_path)
+    changed = False
+    for item in log.get("items", []):
+        code = item.get("shortcode")
+        if code not in moved:
+            continue
+        item["media_type"] = "carousel"
+        item["saved_files"] = moved[code]
+        item["saved_path"] = carousel_folder(collection_dir, code)
+        item["carousel_count"] = len(moved[code])
+        item["status"] = item.get("status") or "ok"
+        changed = True
+    if changed:
+        save_log(log, log_path)
+    return moved
+
+
 def yt_download_carousel(url, output_dir, shortcode, cookies_file,
                          filename_template="{shortcode}", file_index=0):
-    base = build_outtmpl(filename_template, output_dir, file_index)
-    # For carousels, %(id)s is the per-item media ID, not the post shortcode.
-    # Replace it with the actual shortcode so all slides share a consistent prefix.
-    base = base.replace("%(id)s", shortcode)
-    # Insert per-slide index before the extension
-    outtmpl = base.replace(".%(ext)s", "_%(playlist_index)02d.%(ext)s")
+    folder = carousel_folder(output_dir, shortcode)
+    os.makedirs(folder, exist_ok=True)
+    # Numbered slides live in the post folder so photos and videos stay together.
+    outtmpl = os.path.join(folder, "%(playlist_index)02d.%(ext)s")
     opts = {
         "logger": _QuietLogger(),
         "quiet": True,
@@ -510,14 +912,7 @@ def yt_download_carousel(url, output_dir, shortcode, cookies_file,
         opts["cookiefile"] = cookies_file
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
-    try:
-        return sorted(
-            os.path.join(output_dir, f)
-            for f in os.listdir(output_dir)
-            if shortcode in f
-        )
-    except OSError:
-        return []
+    return list_saved_media(folder)
 
 
 # ---------------------------------------------------------------------------
@@ -597,21 +992,44 @@ def instaloader_download(url, output_dir, cookies_file=None, download_videos=Fal
 
 
 def find_saved_files(output_dir, shortcode):
+    folder = carousel_folder(output_dir, shortcode)
+    if os.path.isdir(folder):
+        media = list_saved_media(folder)
+        if media:
+            return media
     try:
         return [
             os.path.join(output_dir, f)
             for f in os.listdir(output_dir)
-            if shortcode in f
+            if shortcode in f and os.path.isfile(os.path.join(output_dir, f))
         ]
     except OSError:
         return []
 
 
 def file_exists_on_disk(output_dir, shortcode):
+    folder = carousel_folder(output_dir, shortcode)
+    if os.path.isdir(folder) and list_saved_media(folder):
+        return True
     try:
-        return any(shortcode in f for f in os.listdir(output_dir))
+        return any(
+            shortcode in f and os.path.isfile(os.path.join(output_dir, f))
+            for f in os.listdir(output_dir)
+        )
     except OSError:
         return False
+
+
+def _saved_fields(output_dir, shortcode, saved, single_type):
+    saved_path, files = settle_slides(output_dir, shortcode, saved)
+    fields = {
+        "media_type": "carousel" if len(files) > 1 else single_type,
+        "saved_path": saved_path,
+        "saved_files": files,
+    }
+    if len(files) > 1:
+        fields["carousel_count"] = len(files)
+    return fields
 
 
 # ---------------------------------------------------------------------------
@@ -659,8 +1077,8 @@ def _download_url_once(url, output_dir, cookies_file, dry_run,
                                              download_videos=True)
                 return {"url": url, "shortcode": shortcode, "username": username,
                         "author": author, "title": title, "caption": caption,
-                        "media_type": "image", "status": "ok",
-                        "saved_path": saved[0] if saved else None, "timestamp": timestamp}
+                        "status": "ok", "timestamp": timestamp,
+                        **_saved_fields(output_dir, shortcode, saved, "image")}
             except Exception as insta_err:
                 return {"url": url, "shortcode": shortcode, "username": username,
                         "author": author, "title": title, "caption": caption,
@@ -688,8 +1106,8 @@ def _download_url_once(url, output_dir, cookies_file, dry_run,
             saved_files = instaloader_download(url, output_dir, cookies_file)
             return {"url": url, "shortcode": shortcode, "username": username,
                     "author": author, "title": title, "caption": caption,
-                    "media_type": "image", "status": "ok",
-                    "saved_path": saved_files[0] if saved_files else None, "timestamp": timestamp}
+                    "status": "ok", "timestamp": timestamp,
+                    **_saved_fields(output_dir, shortcode, saved_files, "image")}
         except Exception as e:
             return {"url": url, "shortcode": shortcode, "username": username,
                     "author": author, "title": title, "caption": caption,
@@ -704,18 +1122,17 @@ def _download_url_once(url, output_dir, cookies_file, dry_run,
             if saved:
                 return {"url": url, "shortcode": shortcode, "username": username,
                         "author": author, "title": title, "caption": caption,
-                        "media_type": "carousel", "status": "ok",
-                        "carousel_count": len(saved),
-                        "saved_path": saved[0], "timestamp": timestamp}
+                        "status": "ok", "timestamp": timestamp,
+                        **_saved_fields(output_dir, shortcode, saved, "carousel")}
             # yt-dlp got nothing — likely an image-only carousel; try instaloader
-            saved_insta = instaloader_download(url, output_dir, cookies_file,
-                                                download_videos=True)
+            saved_insta = instaloader_download(
+                url, carousel_folder(output_dir, shortcode), cookies_file,
+                download_videos=True)
             if saved_insta:
                 return {"url": url, "shortcode": shortcode, "username": username,
                         "author": author, "title": title, "caption": caption,
-                        "media_type": "carousel", "status": "ok",
-                        "carousel_count": len(saved_insta),
-                        "saved_path": saved_insta[0], "timestamp": timestamp}
+                        "status": "ok", "timestamp": timestamp,
+                        **_saved_fields(output_dir, shortcode, saved_insta, "carousel")}
             return {"url": url, "shortcode": shortcode, "username": username,
                     "author": author, "title": title, "caption": caption,
                     "media_type": "carousel", "status": "failed",
@@ -746,8 +1163,8 @@ def _download_url_once(url, output_dir, cookies_file, dry_run,
                                                    download_videos=True)
                 return {"url": url, "shortcode": shortcode, "username": username,
                         "author": author, "title": title, "caption": caption,
-                        "media_type": "image", "status": "ok",
-                        "saved_path": saved_files[0] if saved_files else None, "timestamp": timestamp}
+                        "status": "ok", "timestamp": timestamp,
+                        **_saved_fields(output_dir, shortcode, saved_files, "image")}
             except Exception as insta_err:
                 return {"url": url, "shortcode": shortcode, "username": username,
                         "author": author, "title": title, "caption": caption,
@@ -859,9 +1276,11 @@ def run_download(
             progress_cb({"type": "warning",
                          "message": "ffmpeg not found - video/audio merging may fail"})
 
-    # Derive log file name from collection if not specified
-    if log_file is None:
-        log_file = f"{collection}.json"
+    output_dir = resolve_output_dir(output_base, collection)
+    os.makedirs(output_dir, exist_ok=True)
+    # Log sits beside the media, so the dashboard can find it by collection folder.
+    if not log_file:
+        log_file = os.path.join(output_dir, f"{collection}.json")
 
     urls = load_urls(url_file)
     if not urls:
@@ -884,9 +1303,6 @@ def run_download(
         print(f"Skipping {skipped_auto} already-processed URL(s) - {len(urls)} remaining.")
         if progress_cb:
             progress_cb({"type": "skip_info", "skipped": skipped_auto, "remaining": len(urls)})
-
-    output_dir = resolve_output_dir(output_base, collection)
-    os.makedirs(output_dir, exist_ok=True)
 
     counts = {}
     skipped_disk = 0
@@ -943,7 +1359,6 @@ def run_download(
                         progress_cb({"type": "rate_limit_abort", "consecutive": consecutive_throttle})
                     upsert_log_entry(log, result)
                     save_log(log, log_file)
-                    update_manifest(log_file)
                     break
                 ok = _wait_rate_limit(consecutive_throttle, stop_event=stop_event, progress_cb=progress_cb)
                 if not ok:
@@ -988,7 +1403,6 @@ def run_download(
         }
         log["summary"] = summary
         save_log(log, log_file)
-        update_manifest(log_file)
         i += 1
 
     final_summary = log.get("summary") or {
@@ -998,6 +1412,8 @@ def run_download(
         "cookie_fallbacks": cookie_fallbacks,
         "last_updated": datetime.now(timezone.utc).isoformat(),
     }
+
+    regroup_collection_carousels(output_dir)
 
     print("\n--- Done ---")
     print(f"  OK:      {counts.get('ok', 0)}")
@@ -1026,10 +1442,12 @@ def main():
     parser = argparse.ArgumentParser(
         description="Download Instagram posts from a URL list using yt-dlp + instaloader."
     )
-    parser.add_argument("url_file")
-    parser.add_argument("collection")
+    parser.add_argument("url_file", nargs="?")
+    parser.add_argument("collection", nargs="?")
     parser.add_argument("-l", "--log", default=None,
-                        help="Log file path (default: <collection>.json)")
+                        help="Log file path (default: <output>/<collection>/<collection>.json)")
+    parser.add_argument("--dashboard", action="store_true",
+                        help="Open the dashboard and keep serving collection logs")
     parser.add_argument("--cookies", default=None, metavar="FILE",
                         help=("Path to a cookies.txt file. Only used when a post is "
                               "age-restricted or private (see --cookies-mode)."))
@@ -1052,6 +1470,20 @@ def main():
                             "Example: --filename-template '{author}_{shortcode}'"
                         ))
     args = parser.parse_args()
+
+    if args.dashboard:
+        import webbrowser
+        url = ensure_dashboard_server(extra_roots=[args.output_dir])
+        print(f"Dashboard: {url}")
+        webbrowser.open(url)
+        try:
+            threading.Event().wait()
+        except KeyboardInterrupt:
+            return
+        return
+
+    if not args.url_file or not args.collection:
+        parser.error("url_file and collection are required unless --dashboard is used")
 
     run_download(
         url_file=args.url_file,
