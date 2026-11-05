@@ -477,6 +477,211 @@ def test_download_job_runs_once():
         shutil.rmtree(d, ignore_errors=True)
 
 
+_SAVED_PAGE = """
+<a href="/jane.doe/" aria-label="Profile">Profile</a>
+<a href="/someone.else/">Other</a>
+<a href="/jane.doe/saved/all-posts/">All posts</a>
+<a href="/jane.doe/saved/haircut/998877/">Haircut 9</a>
+<a href="/other/saved/nope/1/">Nope</a>
+<a href="/p/AbCdEfGhIj/">post</a>
+<a href="https://www.instagram.com/reel/ZzYyXxWwVv/">reel</a>
+<script type="application/json">{"x":"/p/AbCdEfGhIj/"}</script>
+"""
+
+
+def test_saved_page_parser_reads_profile_collections_and_posts():
+    assert ig.parse_profile_username(_SAVED_PAGE) == "jane.doe"
+    collections = ig.parse_saved_collections(_SAVED_PAGE, "jane.doe")
+    assert [item["name"] for item in collections] == ["All posts", "Haircut"]
+    assert collections[1]["count"] == 9
+    assert collections[1]["url"].endswith("/jane.doe/saved/haircut/998877/")
+    urls = ig.parse_post_urls(_SAVED_PAGE)
+    assert urls == [
+        "https://www.instagram.com/p/AbCdEfGhIj/",
+        "https://www.instagram.com/reel/ZzYyXxWwVv/",
+    ]
+
+
+def test_saved_collection_url_and_folder_name():
+    assert ig.is_saved_collection_url("https://www.instagram.com/jane.doe/saved/haircut/1/")
+    assert not ig.is_saved_collection_url("https://example.com/jane.doe/saved/haircut/")
+    assert ig.collection_folder_name("bad:name") == "bad name"
+    assert ig.looks_like_login("https://www.instagram.com/accounts/login/", "")
+
+
+def test_write_collection_url_file_and_reject_foreign_download():
+    d = tempfile.mkdtemp(prefix="igdl_saved_")
+    cookies = os.path.join(d, "cookies.txt")
+    with open(cookies, "w", encoding="utf-8") as fh:
+        fh.write("# Netscape HTTP Cookie File\n")
+    try:
+        with mock.patch.object(ig, "browse_home", return_value=os.path.realpath(d)), \
+             mock.patch.object(ig, "load_dashboard_settings", return_value={
+                 "cookies": cookies, "output_dir": d, "filename_template": "{shortcode}",
+             }):
+            _expect_raises(ValueError, ig.prepare_saved_download, {
+                "name": "Haircut",
+                "url": "https://example.com/a/saved/x/",
+            })
+        with mock.patch.object(ig, "__file__", os.path.join(d, "ig_download.py")):
+            path = ig.write_collection_url_file("Haircut", [
+                "https://www.instagram.com/p/AbCdEfGhIj/",
+            ])
+        assert os.path.dirname(os.path.dirname(path)) == os.path.realpath(d)
+        assert os.path.basename(path) == "Haircut.txt"
+        with open(path, encoding="utf-8") as fh:
+            assert "AbCdEfGhIj" in fh.read()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_saved_job_writes_urls_then_downloads():
+    import time
+    d = tempfile.mkdtemp(prefix="igdl_savedjob_")
+    cookies = os.path.join(d, "cookies.txt")
+    with open(cookies, "w", encoding="utf-8") as fh:
+        fh.write("cookies\n")
+    url_file = os.path.join(d, "out.txt")
+    seen = {}
+
+    def fake_collect(cookies_file, collection_url, stop_event=None, progress_cb=None):
+        seen["url"] = collection_url
+        if progress_cb:
+            progress_cb({"type": "collecting", "found": 1, "message": "Reading the collection… 1 posts"})
+        return ["https://www.instagram.com/p/AbCdEfGhIj/"]
+
+    def fake_write(name, urls):
+        seen["name"] = name
+        seen["urls"] = urls
+        return url_file
+
+    def fake_run(**kwargs):
+        seen["download"] = kwargs["url_file"]
+        seen["retry_failed"] = kwargs["retry_failed"]
+        kwargs["progress_cb"]({"type": "done", "summary": {"ok": 1, "failed": 0}})
+        return {}
+
+    try:
+        with mock.patch.object(ig, "prepare_saved_download", return_value={
+                 "cookies": cookies,
+                 "collection": "Haircut",
+                 "url": "https://www.instagram.com/jane.doe/saved/haircut/1/",
+                 "output_dir": d,
+                 "filename_template": "{shortcode}",
+             }), \
+             mock.patch.object(ig, "collect_collection_posts", side_effect=fake_collect), \
+             mock.patch.object(ig, "write_collection_url_file", side_effect=fake_write), \
+             mock.patch.object(ig, "save_dashboard_settings", side_effect=lambda data: data), \
+             mock.patch.object(ig, "run_download", side_effect=fake_run):
+            job = ig.DownloadJob()
+            job.start_saved({"name": "Haircut", "url": "https://www.instagram.com/jane.doe/saved/haircut/1/"})
+            for _ in range(50):
+                if not job.status()["running"]:
+                    break
+                time.sleep(0.02)
+        status = job.status()
+        assert status["running"] is False
+        assert seen["name"] == "Haircut"
+        assert seen["download"] == url_file
+        assert seen["retry_failed"] is True
+        assert status["events"][-1]["type"] == "done"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_carousel_extract_keeps_photo_slides():
+    playlist = {"_type": "playlist", "id": "abc", "entries": [
+        {"formats": [], "thumbnails": [{"url": "https://cdn.example/a.jpg"}]},
+    ]}
+
+    class FakeYDL:
+        def __init__(self, opts):
+            self.opts = opts
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def extract_info(self, url, download=False, process=True):
+            assert process is False
+            return playlist
+        def process_ie_result(self, info, download=False):
+            raise AssertionError("photo slides must stay in the carousel")
+
+    with mock.patch.object(ig.yt_dlp, "YoutubeDL", FakeYDL):
+        info = ig.yt_extract_info("https://www.instagram.com/p/abc/", None)
+    assert info["entries"][0]["thumbnails"][0]["url"].endswith("/a.jpg")
+
+
+def test_video_extract_is_still_resolved():
+    raw = {"id": "abc", "formats": [{"url": "https://cdn.example/v.mp4"}]}
+    resolved = {**raw, "ext": "mp4"}
+
+    class FakeYDL:
+        def __init__(self, opts):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def extract_info(self, url, download=False, process=True):
+            return raw
+        def process_ie_result(self, info, download=False):
+            assert info is raw
+            return resolved
+
+    with mock.patch.object(ig.yt_dlp, "YoutubeDL", FakeYDL):
+        info = ig.yt_extract_info("https://www.instagram.com/reel/abc/", None)
+    assert info["ext"] == "mp4"
+
+
+def test_instaloader_cookies_stay_logged_out():
+    """A sessionid must not flip instaloader onto graphql/query."""
+    d = tempfile.mkdtemp(prefix="igdl_ck_")
+    path = os.path.join(d, "cookies.txt")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("# Netscape HTTP Cookie File\n")
+        fh.write(".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tabc\n")
+        fh.write(".instagram.com\tTRUE\t/\tTRUE\t0\tds_user_id\t42\n")
+    import requests
+    loader = mock.Mock()
+    loader.context.username = None
+    loader.context._session.cookies = requests.cookies.RequestsCookieJar()
+    try:
+        assert ig._apply_instaloader_cookies(loader, path) is True
+        assert not loader.context.username
+        assert "sessionid" in {cookie.name for cookie in loader.context._session.cookies}
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_save_carousel_images_writes_photo_slides_only():
+    d = tempfile.mkdtemp(prefix="igdl_slides_")
+    info = {"entries": [
+        {"formats": [{"url": "https://cdn.example/v.mp4"}], "thumbnails": [{"url": "https://cdn.example/skip.jpg", "width": 10, "height": 10}]},
+        {"formats": [], "thumbnails": [
+            {"url": "https://cdn.example/small.jpg", "width": 100, "height": 100},
+            {"url": "https://cdn.example/large.jpg", "width": 800, "height": 800},
+        ]},
+    ]}
+
+    class _Response:
+        def read(self):
+            return b"jpeg"
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+
+    try:
+        with mock.patch.object(ig.urllib.request, "urlopen", return_value=_Response()) as opened:
+            saved = ig.save_carousel_images(info, d)
+        assert [os.path.basename(path) for path in saved] == ["02.jpg"]
+        assert opened.call_args.args[0].full_url == "https://cdn.example/large.jpg"
+        assert os.path.getsize(os.path.join(d, "02.jpg")) > 0
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_run_download_rejects_traversal_collection():
     d = tempfile.mkdtemp(prefix="igdl_trav_")
     try:

@@ -22,6 +22,7 @@ private. Override with --cookies-mode always|never.
 """
 
 import argparse
+import html
 import json
 import mimetypes
 import os
@@ -34,7 +35,9 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 try:
@@ -750,6 +753,401 @@ def browse_directory(path=None):
     }
 
 
+_RESERVED_PROFILES = {
+    "explore", "reels", "direct", "accounts", "stories", "p", "reel", "saved",
+    "legal", "about", "privacy", "terms", "emails", "directory", "developer",
+    "challenge", "login", "tv", "ar", "nametag",
+}
+_POST_URL_RE = re.compile(
+    r"(?:https://www\.instagram\.com)?/(?:[^/\"'\\s]+/)?(p|reel)/([A-Za-z0-9_-]{5,})/?"
+)
+_BROWSER_LOCK = threading.Lock()
+_LOGIN_AGAIN = "Instagram asked you to log in. Export cookies.txt again."
+
+
+class _AnchorParser(HTMLParser):
+    """Collect anchor hrefs and the text shown inside them."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.anchors = []
+        self._href = None
+        self._label = ""
+        self._buf = []
+
+    def handle_starttag(self, tag, attrs):
+        ad = {key.lower(): value or "" for key, value in attrs}
+        if tag == "img" and self._href is not None and ad.get("alt"):
+            self._buf.append(ad["alt"])
+        if tag != "a":
+            return
+        href = html.unescape(ad.get("href") or "")
+        if not href:
+            return
+        self._href = href
+        self._label = ad.get("aria-label") or ""
+        self._buf = []
+
+    def handle_data(self, data):
+        if self._href is not None:
+            self._buf.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._href is not None:
+            text = " ".join("".join(self._buf).split())
+            self.anchors.append((self._href, text, self._label))
+            self._href = None
+
+
+def _anchors(page_html):
+    parser = _AnchorParser()
+    try:
+        parser.feed(page_html or "")
+        parser.close()
+    except Exception:
+        return []
+    return parser.anchors
+
+
+def _path_parts(href):
+    href = html.unescape(href or "").strip()
+    if href.startswith("http://") or href.startswith("https://"):
+        parsed = urllib.parse.urlparse(href)
+        host = (parsed.netloc or "").lower()
+        if host and host not in ("www.instagram.com", "instagram.com"):
+            return []
+        path = parsed.path
+    else:
+        path = href
+    path = path.split("?", 1)[0].split("#", 1)[0]
+    return [part for part in path.split("/") if part]
+
+
+def parse_profile_username(page_html):
+    """The logged-in home page links to /{username}/. Prefer the Profile control."""
+    labeled = []
+    counts = {}
+    for href, text, label in _anchors(page_html):
+        parts = _path_parts(href)
+        if len(parts) != 1 or not re.fullmatch(r"[A-Za-z0-9._]+", parts[0]):
+            continue
+        if parts[0].lower() in _RESERVED_PROFILES:
+            continue
+        blob = f"{label} {text}".lower()
+        if "profile" in blob:
+            labeled.append(parts[0])
+        counts[parts[0]] = counts.get(parts[0], 0) + 1
+    if labeled:
+        return labeled[0]
+    if not counts:
+        return ""
+    return max(counts, key=counts.get)
+
+
+def _collection_label(text, slug):
+    text = " ".join((text or "").split())
+    match = re.match(r"^(.*?\D)\s+(\d+)\s*(?:posts?)?$", text, re.I)
+    if match and match.group(1).strip():
+        return match.group(1).strip(), int(match.group(2))
+    if text and not text.isdigit():
+        return text, None
+    pretty = (slug or "").replace("-", " ").strip()
+    return pretty or slug, None
+
+
+def parse_saved_collections(page_html, username):
+    """Collection tiles on /{username}/saved/: name, link, and count when shown."""
+    found = []
+    seen = set()
+    owner = (username or "").lower()
+    for href, text, _label in _anchors(page_html):
+        parts = _path_parts(href)
+        if len(parts) < 3 or parts[0].lower() != owner or parts[1].lower() != "saved":
+            continue
+        slug = parts[2]
+        if slug.lower() in ("", "saved"):
+            continue
+        url = "https://www.instagram.com/" + "/".join(parts) + "/"
+        if url in seen:
+            continue
+        seen.add(url)
+        name, count = _collection_label(text, slug)
+        item = {"name": name, "url": url}
+        if count is not None:
+            item["count"] = count
+        found.append(item)
+    return found
+
+
+def parse_post_urls(page_html):
+    """Post and reel links, in the order the page first mentions each code."""
+    found = []
+    seen = set()
+    for kind, code in _POST_URL_RE.findall(page_html or ""):
+        kind = kind.lower()
+        if code in seen:
+            continue
+        seen.add(code)
+        found.append(f"https://www.instagram.com/{kind}/{code}/")
+    return found
+
+
+def looks_like_login(url, page_html):
+    path = urllib.parse.urlparse(url or "").path.lower()
+    if path.startswith("/accounts/login") or "/accounts/login" in path:
+        return True
+    body = page_html or ""
+    return "accounts/login" in body and 'name="username"' in body
+
+
+def collection_folder_name(name):
+    """Turn a collection title into one folder name."""
+    cleaned = _INVALID_NAME_CHARS.sub(" ", name or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    return validate_collection(cleaned)
+
+
+def is_saved_collection_url(url):
+    parsed = urllib.parse.urlparse((url or "").strip())
+    if parsed.scheme != "https" or parsed.netloc.lower() not in ("www.instagram.com", "instagram.com"):
+        return False
+    parts = [part for part in parsed.path.split("/") if part]
+    return len(parts) >= 3 and parts[1].lower() == "saved"
+
+
+def require_cookies_file():
+    settings = load_dashboard_settings()
+    cookies = settings.get("cookies") or ""
+    if not cookies or not os.path.isfile(cookies):
+        raise ValueError("Choose a cookies file first.")
+    if not path_is_under(cookies, [browse_home()]):
+        raise ValueError("Cookies file must stay inside your user folder.")
+    return cookies, settings
+
+
+def playwright_cookies(cookies_file):
+    """Netscape cookies for Playwright. Values stay on this machine."""
+    import http.cookiejar
+    jar = http.cookiejar.MozillaCookieJar(cookies_file)
+    try:
+        jar.load(ignore_discard=True, ignore_expires=True)
+    except OSError as exc:
+        raise ValueError("The cookies file could not be read.") from exc
+    cookies = []
+    for cookie in jar:
+        domain = cookie.domain or ""
+        if "instagram.com" not in domain:
+            continue
+        item = {
+            "name": cookie.name,
+            "value": cookie.value,
+            "domain": domain if domain.startswith(".") else domain,
+            "path": cookie.path or "/",
+            "secure": bool(cookie.secure),
+            "httpOnly": cookie.name == "sessionid" or "HttpOnly" in (getattr(cookie, "_rest", {}) or {}),
+        }
+        if cookie.expires:
+            item["expires"] = int(cookie.expires)
+        cookies.append(item)
+    if not any(item["name"] == "sessionid" for item in cookies):
+        raise ValueError(_LOGIN_AGAIN)
+    return cookies
+
+
+class SavedPageError(ValueError):
+    """The saved page stopped early. ``urls`` are the posts read so far."""
+
+    def __init__(self, message, urls=None):
+        super().__init__(message)
+        self.urls = list(urls or [])
+
+
+def _open_instagram(cookies_file):
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise ValueError(
+            "Reading the saved page needs Playwright. "
+            "Run: pip install playwright && python -m playwright install chromium"
+        ) from exc
+    pw = sync_playwright().start()
+    try:
+        browser = pw.chromium.launch(headless=True)
+    except Exception as exc:
+        pw.stop()
+        raise ValueError(
+            "Chromium for Playwright is not installed. Run: python -m playwright install chromium"
+        ) from exc
+    context = browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        ),
+        viewport={"width": 1280, "height": 900},
+    )
+    context.add_cookies(playwright_cookies(cookies_file))
+    return pw, browser, context.new_page()
+
+
+def _click_retry(page):
+    try:
+        page.evaluate(
+            """() => {
+                for (const el of document.querySelectorAll('button, [role="button"]')) {
+                    const text = (el.textContent || '').trim().toLowerCase();
+                    if (text === 'retry' || text === 'try again') { el.click(); return true; }
+                }
+                return false;
+            }"""
+        )
+    except Exception:
+        return False
+
+
+def _scroll_collect(page, parse_fn, stop_event=None, on_step=None, idle_rounds=3, max_steps=500):
+    """Scroll like the userscript until the page stops growing. Returns the last parse."""
+    seen_height = 0
+    idle = 0
+    last = parse_fn("")
+    for _step in range(max_steps):
+        if stop_event is not None and stop_event.is_set():
+            break
+        page_html = page.content()
+        if looks_like_login(page.url, page_html):
+            raise SavedPageError(_LOGIN_AGAIN, parse_fn(page_html))
+        last = parse_fn(page_html)
+        if on_step:
+            on_step(last)
+        _click_retry(page)
+        height = page.evaluate("() => document.body ? document.body.scrollHeight : 0") or 0
+        near_bottom = page.evaluate(
+            "() => window.scrollY + window.innerHeight >= (document.body ? document.body.scrollHeight : 0) - 600"
+        )
+        page.evaluate("() => window.scrollBy(0, Math.max(window.innerHeight * 0.85, 400))")
+        page.wait_for_timeout(700)
+        if near_bottom and height <= seen_height + 40:
+            idle += 1
+        else:
+            idle = 0
+        if height > seen_height:
+            seen_height = height
+        if idle >= idle_rounds:
+            break
+    page_html = page.content()
+    if looks_like_login(page.url, page_html):
+        raise SavedPageError(_LOGIN_AGAIN, parse_fn(page_html))
+    return parse_fn(page_html)
+
+
+def _close_instagram(pw, browser):
+    try:
+        browser.close()
+    except Exception:
+        pass
+    try:
+        pw.stop()
+    except Exception:
+        pass
+
+
+def list_saved_collections():
+    """Open the saved page and return the collection names and links on it."""
+    cookies, _settings = require_cookies_file()
+    with _BROWSER_LOCK:
+        pw, browser, page = _open_instagram(cookies)
+        try:
+            page.goto("https://www.instagram.com/", wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(1500)
+            if looks_like_login(page.url, page.content()):
+                raise ValueError(_LOGIN_AGAIN)
+            username = parse_profile_username(page.content())
+            if not username:
+                raise ValueError(
+                    "Could not find your profile link. Export cookies.txt again and retry."
+                )
+            page.goto(
+                f"https://www.instagram.com/{username}/saved/",
+                wait_until="domcontentloaded",
+                timeout=45000,
+            )
+            page.wait_for_timeout(1500)
+            try:
+                page.wait_for_selector('a[href*="/saved/"]', timeout=15000)
+            except Exception:
+                pass
+            collections = _scroll_collect(
+                page, lambda page_html: parse_saved_collections(page_html, username)
+            )
+            return {"username": username, "collections": collections}
+        finally:
+            _close_instagram(pw, browser)
+
+
+def collect_collection_posts(cookies_file, collection_url, stop_event=None, progress_cb=None):
+    """Open one collection page, scroll to the end, and return post and reel URLs."""
+    if not is_saved_collection_url(collection_url):
+        raise ValueError("That is not a saved collection link.")
+    with _BROWSER_LOCK:
+        pw, browser, page = _open_instagram(cookies_file)
+        try:
+            page.goto(collection_url, wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(1500)
+
+            def on_step(urls):
+                if progress_cb:
+                    progress_cb({
+                        "type": "collecting",
+                        "found": len(urls),
+                        "message": f"Reading the collection… {len(urls)} posts",
+                    })
+
+            return _scroll_collect(page, parse_post_urls, stop_event=stop_event, on_step=on_step)
+        finally:
+            _close_instagram(pw, browser)
+
+
+def write_collection_url_file(name, urls):
+    """Store the collected links beside the project. Collections/ is gitignored."""
+    folder = collection_folder_name(name)
+    directory = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Collections")
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, f"{folder}.txt")
+    with open(path, "w", encoding="utf-8") as fh:
+        for url in urls:
+            fh.write(url + "\n")
+    return path
+
+
+def prepare_saved_download(params):
+    """Check a saved-collection request before the browser opens."""
+    if not isinstance(params, dict):
+        raise ValueError("Expected a JSON object.")
+    cookies, settings = require_cookies_file()
+    name = collection_folder_name(params.get("name"))
+    url = (params.get("url") or "").strip()
+    if not is_saved_collection_url(url):
+        raise ValueError("That is not a saved collection link.")
+    output_full = _resolve_user_path(settings.get("output_dir") or "downloads")
+    home = browse_home()
+    if os.path.isdir(output_full):
+        if not path_is_under(output_full, [home]):
+            raise ValueError("Output folder must stay inside your user folder.")
+    else:
+        parent = os.path.dirname(output_full) or output_full
+        if not path_is_under(parent, [home]):
+            raise ValueError("Output folder must stay inside your user folder.")
+    template = validate_filename_template(settings.get("filename_template") or "{shortcode}")
+    retry = params.get("retry_failed", True)
+    return {
+        "cookies": cookies,
+        "collection": name,
+        "url": url,
+        "output_dir": output_full,
+        "filename_template": template,
+        "retry_failed": True if retry is None else bool(retry),
+    }
+
+
 class DownloadBusy(RuntimeError):
     """A download is already running in this process."""
 
@@ -841,15 +1239,22 @@ class DownloadJob:
             stop.set()
         return self.status()
 
-    def start(self, params):
-        prepared = prepare_download_request(params)
+    def _begin(self):
         with self._lock:
             if self._running:
                 raise DownloadBusy("A download is already running.")
             self._events = []
             self._running = True
             self._stop = threading.Event()
-            stop = self._stop
+            return self._stop
+
+    def _finish(self):
+        with self._lock:
+            self._running = False
+
+    def start(self, params):
+        prepared = prepare_download_request(params)
+        stop = self._begin()
 
         def _run():
             try:
@@ -868,10 +1273,62 @@ class DownloadJob:
             except Exception as exc:
                 self._append({"type": "error", "message": str(exc)})
             finally:
-                with self._lock:
-                    self._running = False
+                self._finish()
 
         threading.Thread(target=_run, name="ig-download-job", daemon=True).start()
+        return self.status()
+
+    def start_saved(self, params):
+        """Read one saved collection from its page, then download those posts."""
+        prepared = prepare_saved_download(params)
+        stop = self._begin()
+
+        def _run():
+            try:
+                self._append({
+                    "type": "collecting",
+                    "found": 0,
+                    "message": "Opening the collection…",
+                })
+                try:
+                    urls = collect_collection_posts(
+                        prepared["cookies"], prepared["url"], stop, self._append
+                    )
+                except SavedPageError as exc:
+                    if exc.urls:
+                        write_collection_url_file(prepared["collection"], exc.urls)
+                    raise
+                if stop.is_set():
+                    if urls:
+                        write_collection_url_file(prepared["collection"], urls)
+                    self._append({"type": "stopped"})
+                    return
+                if not urls:
+                    raise ValueError("No posts found in that collection.")
+                url_file = write_collection_url_file(prepared["collection"], urls)
+                save_dashboard_settings({"url_file": url_file})
+                self._append({
+                    "type": "collecting",
+                    "found": len(urls),
+                    "message": f"Found {len(urls)} posts. Starting download.",
+                })
+                run_download(
+                    url_file=url_file,
+                    collection=prepared["collection"],
+                    cookies=prepared["cookies"],
+                    cookies_mode=COOKIES_MODE_ALWAYS,
+                    output_base=prepared["output_dir"],
+                    retry_failed=prepared.get("retry_failed", True),
+                    filename_template=prepared["filename_template"],
+                    progress_cb=self._append,
+                    stop_event=stop,
+                )
+            except Exception as exc:
+                self._append({"type": "error", "message": str(exc)})
+            finally:
+                self._finish()
+
+        threading.Thread(target=_run, name="ig-saved-job", daemon=True).start()
         return self.status()
 
 
@@ -902,6 +1359,15 @@ class _DashboardHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/download/status":
             since = urllib.parse.parse_qs(parsed.query).get("since", ["0"])[0]
             self._send_json(self._job().status(since))
+            return
+        if parsed.path == "/api/saved/collections":
+            if self._job().status()["running"]:
+                self._send_error_json(409, "A download is already running.")
+                return
+            try:
+                self._send_json(list_saved_collections())
+            except ValueError as exc:
+                self._send_error_json(400, str(exc))
             return
         if parsed.path == "/api/log":
             self._serve_allowed(parsed.query, kind="log")
@@ -934,6 +1400,14 @@ class _DashboardHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/download":
             try:
                 self._send_json(self._job().start(data))
+            except DownloadBusy as exc:
+                self._send_error_json(409, str(exc))
+            except ValueError as exc:
+                self._send_error_json(400, str(exc))
+            return
+        if parsed.path == "/api/saved/download":
+            try:
+                self._send_json(self._job().start_saved(data))
             except DownloadBusy as exc:
                 self._send_error_json(409, str(exc))
             except ValueError as exc:
@@ -1179,11 +1653,15 @@ def _ydl_opts(outtmpl=None, cookies_file=None, skip_download=False, noplaylist=T
 
 
 def yt_extract_info(url, cookies_file):
-    # noplaylist=False so carousels return their full entries list
+    # noplaylist=False so carousels return their full entries list.
+    # process=False keeps photo slides. Resolving the playlist makes yt-dlp
+    # treat the first photo as a failed video and abort the whole post.
     with yt_dlp.YoutubeDL(_ydl_opts(skip_download=True, cookies_file=cookies_file, noplaylist=False)) as ydl:
-        info = ydl.extract_info(url, download=False)
-    if info is None:
-        raise RuntimeError("yt-dlp returned no info")
+        info = ydl.extract_info(url, download=False, process=False)
+        if info is None:
+            raise RuntimeError("yt-dlp returned no info")
+        if info.get("_type") != "playlist":
+            info = ydl.process_ie_result(info, download=False)
     return info
 
 
@@ -1295,6 +1773,57 @@ def regroup_collection_carousels(collection_dir):
     return moved
 
 
+def _best_image_url(entry):
+    """Largest thumbnail yt-dlp already found for a slide that has no video."""
+    best_url = None
+    best_area = -1
+    for thumb in entry.get("thumbnails") or []:
+        if not isinstance(thumb, dict) or not thumb.get("url"):
+            continue
+        area = (thumb.get("width") or 0) * (thumb.get("height") or 0)
+        if area >= best_area:
+            best_area = area
+            best_url = thumb["url"]
+    return best_url
+
+
+def save_carousel_images(info, folder):
+    """Save photo slides yt-dlp listed but will not download as video.
+
+    Image slides have thumbnail URLs and no video formats. Returns the files written.
+    """
+    entries = info.get("entries") if isinstance(info, dict) else None
+    if not entries:
+        return []
+    os.makedirs(folder, exist_ok=True)
+    saved = []
+    for index, entry in enumerate(entries, start=1):
+        if not isinstance(entry, dict) or entry.get("formats"):
+            continue
+        image_url = _best_image_url(entry)
+        if not image_url:
+            continue
+        dest = os.path.join(folder, f"{index:02d}.jpg")
+        if os.path.isfile(dest) and os.path.getsize(dest) > 0:
+            saved.append(dest)
+            continue
+        request = urllib.request.Request(image_url, headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://www.instagram.com/",
+        })
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                data = response.read()
+        except Exception:
+            continue
+        if not data:
+            continue
+        with open(dest, "wb") as fh:
+            fh.write(data)
+        saved.append(dest)
+    return saved
+
+
 def yt_download_carousel(url, output_dir, shortcode, cookies_file,
                          filename_template="{shortcode}", file_index=0):
     folder = carousel_folder(output_dir, shortcode)
@@ -1325,10 +1854,10 @@ def yt_download_carousel(url, output_dir, shortcode, cookies_file,
 def _apply_instaloader_cookies(L, cookies_file):
     """Load a Netscape cookies.txt into an instaloader session (best effort).
 
-    Returns True when cookies were loaded. instaloader refuses to follow an
-    authenticated redirect unless ``context.is_logged_in`` is true, so when a
-    ``sessionid`` cookie is present we also mark the context as authenticated.
-    Only ever called when the caller has decided cookies are required.
+    The cookies stay in the request jar. The context is deliberately not marked
+    logged-in: instaloader then asks ``api/graphql`` for the post. Marking it
+    logged-in switches that request to ``graphql/query``, which returns an empty
+    body and breaks every photo carousel.
     """
     if not cookies_file or not os.path.exists(cookies_file):
         return False
@@ -1337,11 +1866,6 @@ def _apply_instaloader_cookies(L, cookies_file):
         jar = http.cookiejar.MozillaCookieJar(cookies_file)
         jar.load(ignore_discard=True, ignore_expires=True)
         L.context._session.cookies.update(jar)
-        names = {c.name for c in L.context._session.cookies}
-        if "sessionid" in names and not L.context.username:
-            ds = next((c.value for c in L.context._session.cookies
-                       if c.name == "ds_user_id"), None)
-            L.context.username = ds or "cookies"
         return True
     except Exception:
         return False
@@ -1520,8 +2044,13 @@ def _download_url_once(url, output_dir, cookies_file, dry_run,
 
     if media_type == "carousel":
         try:
-            saved = yt_download_carousel(url, output_dir, shortcode, cookies_file,
-                                         filename_template, file_index)
+            folder = carousel_folder(output_dir, shortcode)
+            entries = [entry for entry in (info.get("entries") or []) if isinstance(entry, dict)]
+            if any(entry.get("formats") for entry in entries):
+                yt_download_carousel(url, output_dir, shortcode, cookies_file,
+                                     filename_template, file_index)
+            save_carousel_images(info, folder)
+            saved = list_saved_media(folder)
             if saved:
                 return {"url": url, "shortcode": shortcode, "username": username,
                         "author": author, "title": title, "caption": caption,
@@ -1841,6 +2370,46 @@ def run_download(
 # CLI entry point
 # ---------------------------------------------------------------------------
 
+_CTRL_HANDLER = None
+
+
+def _exit_dashboard():
+    """Leave the console immediately. A browser child can otherwise keep it open."""
+    server = _dashboard_server
+    job = getattr(server, "job", None) if server is not None else None
+    if job is not None:
+        try:
+            job.stop()
+        except Exception:
+            pass
+    if server is not None:
+        try:
+            server.shutdown()
+        except Exception:
+            pass
+    os._exit(0)
+
+
+def _install_ctrl_c_exit():
+    """Ctrl+C must stop the dashboard even when Windows will not interrupt a wait."""
+    global _CTRL_HANDLER
+    if os.name != "nt":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    routine = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+
+    def _handler(ctrl_type):
+        # 0 is Ctrl+C, 1 is Ctrl+Break.
+        if ctrl_type in (0, 1):
+            os._exit(0)
+        return False
+
+    _CTRL_HANDLER = routine(_handler)
+    ctypes.windll.kernel32.SetConsoleCtrlHandler(_CTRL_HANDLER, True)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Download Instagram posts from a URL list using yt-dlp + instaloader."
@@ -1878,11 +2447,15 @@ def main():
         import webbrowser
         url = ensure_dashboard_server(extra_roots=[args.output_dir])
         print(f"Dashboard: {url}")
+        print("Press Ctrl+C to stop.", flush=True)
         webbrowser.open(url)
+        _install_ctrl_c_exit()
         try:
-            threading.Event().wait()
+            # Event.wait() never wakes for Ctrl+C on Windows. sleep() does.
+            while True:
+                time.sleep(0.25)
         except KeyboardInterrupt:
-            return
+            _exit_dashboard()
         return
 
     if not args.url_file or not args.collection:

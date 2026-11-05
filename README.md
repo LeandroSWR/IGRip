@@ -162,13 +162,24 @@ Covered: error classification, the cookie-fallback policy, Instagram URL/shortco
 
 ## Extensions
 
+### Saved collections
+
+On the Download tab, **Refresh** opens your saved page with the cookies file and lists the collections shown there. **Download** on a row reads every post and reel link from that collection's page, writes `Collections/<name>.txt`, and starts the download into the saved output folder. Cookies are sent with every post in that run.
+
+The first time you use it, install the page reader:
+
+```
+pip install -r requirements.txt
+python -m playwright install chromium
+```
+
 ### IG Link Collector (Tampermonkey userscript)
 
-A companion browser extension that scrolls through your Instagram saved collection and exports all post URLs as a plain text file - ready to feed directly into igdl.
+The userscript is still there for Explore or someone else's profile. Saved collections no longer need it.
 
 **Install:** [IG Link Collector](https://github.com/doncezart/IGbulkCollector)
 
-Requires [Tampermonkey](https://www.tampermonkey.net/). Once installed, navigate to your saved posts on Instagram. A small control panel appears in the corner. Hit **Start** and let it scroll; when done, click **Export** to download the URL list.
+Requires [Tampermonkey](https://www.tampermonkey.net/). Once installed, open a feed on Instagram. A small control panel appears in the corner. Hit **Start** and let it scroll; when done, click **Export** to download the URL list.
 
 ---
 

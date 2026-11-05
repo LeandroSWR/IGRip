@@ -2,9 +2,11 @@ import { useEffect, useRef, useState } from "react";
 import {
   browseFolder,
   downloadStatus,
+  loadSavedCollections,
   loadSettings,
   saveSettings,
   startDownload,
+  startSavedDownload,
   stopDownload,
 } from "../api.js";
 
@@ -19,6 +21,8 @@ const TEMPLATES = [
 
 function lineFor(event) {
   switch (event.type) {
+    case "collecting":
+      return event.message || `Reading the collection… ${event.found || 0} posts`;
     case "start":
       return `Starting ${event.to_process} of ${event.total} posts`;
     case "downloading":
@@ -57,11 +61,14 @@ export default function DownloadView({ onLibraryChanged }) {
   const [form, setForm] = useState(null);
   const [collection, setCollection] = useState("");
   const [dryRun, setDryRun] = useState(false);
-  const [retryFailed, setRetryFailed] = useState(false);
+  const [retryFailed, setRetryFailed] = useState(true);
   const [message, setMessage] = useState("");
   const [running, setRunning] = useState(false);
   const [lines, setLines] = useState([]);
   const [progress, setProgress] = useState({ index: 0, total: 0, ok: 0, failed: 0 });
+  const [saved, setSaved] = useState([]);
+  const [savedMessage, setSavedMessage] = useState("");
+  const [loadingSaved, setLoadingSaved] = useState(false);
   const [picker, setPicker] = useState(null);
   const [listing, setListing] = useState(null);
   const since = useRef(0);
@@ -168,6 +175,36 @@ export default function DownloadView({ onLibraryChanged }) {
     remember(next);
   }
 
+  async function refreshSaved() {
+    setLoadingSaved(true);
+    setSavedMessage("");
+    try {
+      const data = await loadSavedCollections();
+      setSaved(data.collections || []);
+      setSavedMessage(data.collections?.length ? "" : "No saved collections on that page.");
+    } catch (error) {
+      setSaved([]);
+      setSavedMessage(error.message);
+    } finally {
+      setLoadingSaved(false);
+    }
+  }
+
+  async function downloadSaved(item) {
+    setCollection(item.name || "");
+    setMessage("");
+    setLines([]);
+    setProgress({ index: 0, total: 0, ok: 0, failed: 0 });
+    since.current = 0;
+    finished.current = false;
+    try {
+      await startSavedDownload({ url: item.url, name: item.name, retry_failed: retryFailed });
+      setRunning(true);
+    } catch (error) {
+      setMessage(error.message);
+    }
+  }
+
   async function onStart() {
     setMessage("");
     setLines([]);
@@ -203,6 +240,29 @@ export default function DownloadView({ onLibraryChanged }) {
 
   return (
     <section className="download">
+      <div className="saved-head">
+        <h2>Saved collections</h2>
+        <button type="button" className="btn btn-secondary" disabled={running || loadingSaved} onClick={refreshSaved}>
+          {loadingSaved ? "Reading page…" : "Refresh"}
+        </button>
+      </div>
+      {savedMessage && <p className="form-error">{savedMessage}</p>}
+      {saved.length > 0 && (
+        <div className="saved-list">
+          {saved.map((item) => (
+            <div className="saved-row" key={item.url}>
+              <div>
+                <div className="saved-name">{item.name}</div>
+                {item.count != null && <div className="saved-count">{item.count} posts</div>}
+              </div>
+              <button type="button" className="btn btn-primary" disabled={running || loadingSaved} onClick={() => downloadSaved(item)}>
+                Download
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
       <div className="download-grid">
         <label>
           URL file

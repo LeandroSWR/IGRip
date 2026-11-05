@@ -93,6 +93,24 @@ export async function stopDownload() {
   return data;
 }
 
+export async function loadSavedCollections() {
+  const response = await fetch("/api/saved/collections", { cache: "no-store" });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || "Could not read saved collections.");
+  return data;
+}
+
+export async function startSavedDownload(body) {
+  const response = await fetch("/api/saved/download", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || "Could not start that collection.");
+  return data;
+}
+
 export async function downloadStatus(since) {
   const response = await fetch(`/api/download/status?since=${since}`, { cache: "no-store" });
   if (!response.ok) throw new Error("Could not read download progress.");

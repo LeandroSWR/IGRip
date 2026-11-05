@@ -3,7 +3,7 @@ export default function TopBar({ view, onView, onPickFiles }) {
     <header className="topbar">
       <div className="brand">
         <div className="brand-icon">📷</div>
-        <span className="brand-text">IG Downloader</span>
+        <span className="brand-text">IG RIP</span>
       </div>
       <div className="topbar-actions">
         <div className="view-toggle">

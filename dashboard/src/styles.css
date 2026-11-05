@@ -150,6 +150,15 @@ th { color: var(--muted); font-size: 12px; }
 .mono { font-family: ui-monospace, monospace; }
 .pagination { display: flex; gap: 10px; align-items: center; justify-content: center; margin-top: 12px; }
 
+.saved-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.saved-head h2 { margin: 0; font-size: 16px; }
+.saved-list { display: grid; gap: 8px; margin-bottom: 22px; }
+.saved-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  background: var(--surf); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px;
+}
+.saved-name { font-weight: 650; }
+.saved-count { color: var(--muted); font-size: 12px; }
 .download-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 16px; }
 .download-grid label, .download-options .check { display: grid; gap: 6px; color: var(--muted); font-size: 12px; }
 .download-grid input, .download-grid select {
