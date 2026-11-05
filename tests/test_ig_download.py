@@ -12,6 +12,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 from unittest import mock
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -355,6 +356,125 @@ def test_video_poster_path_stays_out_of_the_media_folder():
     poster = ig.video_poster_path(video)
     assert os.path.basename(os.path.dirname(poster)) == ".posters"
     assert poster.endswith(os.path.join(".posters", "clip.mp4.jpg"))
+
+
+def test_dashboard_ui_root_prefers_the_react_build():
+    d = tempfile.mkdtemp(prefix="igdl_ui_")
+    try:
+        assert ig.dashboard_ui_root(d) == d
+        dist = os.path.join(d, "dashboard", "dist")
+        os.makedirs(dist)
+        with open(os.path.join(dist, "index.html"), "w", encoding="utf-8") as f:
+            f.write("<!doctype html>")
+        assert ig.dashboard_ui_root(d) == dist
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_settings_roundtrip_keeps_known_fields():
+    d = tempfile.mkdtemp(prefix="igdl_set_")
+    path = os.path.join(d, "settings.json")
+    try:
+        with mock.patch.object(ig, "dashboard_settings_path", return_value=path), \
+             mock.patch.object(ig, "remember_library_roots", return_value=[]):
+            saved = ig.save_dashboard_settings({
+                "output_dir": os.path.join(d, "media"),
+                "cookies_mode": "always",
+                "filename_template": "{author}_{shortcode}",
+                "nope": "secret",
+            })
+            assert saved["output_dir"] == os.path.abspath(os.path.join(d, "media"))
+            assert saved["cookies_mode"] == "always"
+            assert "nope" not in saved
+            assert ig.load_dashboard_settings()["filename_template"] == "{author}_{shortcode}"
+            again = ig.save_dashboard_settings({
+                "cookies_mode": "sometimes",
+                "filename_template": "../x",
+            })
+            assert again["cookies_mode"] == "always"
+            assert again["filename_template"] == "{author}_{shortcode}"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_browse_lists_txt_and_rejects_outside_home():
+    d = tempfile.mkdtemp(prefix="igdl_browse_")
+    home = os.path.join(d, "home")
+    outside = os.path.join(d, "outside")
+    os.makedirs(os.path.join(home, "sub"))
+    os.makedirs(outside)
+    with open(os.path.join(home, "list.txt"), "w", encoding="utf-8") as fh:
+        fh.write("x\n")
+    with open(os.path.join(home, "notes.md"), "w", encoding="utf-8") as fh:
+        fh.write("no\n")
+    try:
+        with mock.patch.object(ig, "browse_home", return_value=os.path.realpath(home)):
+            listing = ig.browse_directory(home)
+            assert [item["name"] for item in listing["files"]] == ["list.txt"]
+            assert any(item["name"] == "sub" for item in listing["dirs"])
+            _expect_raises(ValueError, ig.browse_directory, outside)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_prepare_download_rejects_a_missing_url_file():
+    d = tempfile.mkdtemp(prefix="igdl_prep_")
+    try:
+        with mock.patch.object(ig, "browse_home", return_value=os.path.realpath(d)):
+            _expect_raises(ValueError, ig.prepare_download_request, {
+                "url_file": os.path.join(d, "missing.txt"),
+                "collection": "Haircut",
+                "output_dir": d,
+            })
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_download_job_runs_once():
+    import time
+    d = tempfile.mkdtemp(prefix="igdl_job_")
+    urlf = os.path.join(d, "urls.txt")
+    with open(urlf, "w", encoding="utf-8") as fh:
+        fh.write("https://www.instagram.com/p/AAA/\n")
+    started = threading.Event()
+    release = threading.Event()
+    seen = []
+
+    def fake_run(**kwargs):
+        seen.append(kwargs["collection"])
+        kwargs["progress_cb"]({"type": "start", "total": 1, "to_process": 1})
+        started.set()
+        assert release.wait(2)
+        kwargs["progress_cb"]({"type": "done", "summary": {"ok": 0, "failed": 0}})
+        return {}
+
+    try:
+        with mock.patch.object(ig, "browse_home", return_value=os.path.realpath(d)), \
+             mock.patch.object(ig, "save_dashboard_settings", side_effect=lambda data: data), \
+             mock.patch.object(ig, "run_download", side_effect=fake_run):
+            job = ig.DownloadJob()
+            params = {
+                "url_file": urlf,
+                "collection": "Haircut",
+                "output_dir": d,
+                "cookies": "",
+                "cookies_mode": "fallback",
+            }
+            job.start(params)
+            assert started.wait(2)
+            _expect_raises(ig.DownloadBusy, job.start, dict(params))
+            release.set()
+            for _ in range(50):
+                if not job.status()["running"]:
+                    break
+                time.sleep(0.02)
+            status = job.status()
+            assert status["running"] is False
+            assert seen == ["Haircut"]
+            assert [event["type"] for event in status["events"]] == ["start", "done"]
+    finally:
+        release.set()
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def test_run_download_rejects_traversal_collection():

@@ -2,7 +2,7 @@
 
 ![igdl screenshot](https://i.imgur.com/zeTc3GH.png)
 
-A desktop tool for batch-downloading Instagram posts - videos, reels, image posts, and carousels - from a plain list of URLs. Comes with a CLI, a tkinter GUI, and an HTML log viewer.
+A desktop tool for batch-downloading Instagram posts - videos, reels, image posts, and carousels - from a plain list of URLs. The browser dashboard is the app: it starts downloads, remembers your folders, and shows the library. A CLI remains for scripts.
 
 ---
 
@@ -11,8 +11,8 @@ A desktop tool for batch-downloading Instagram posts - videos, reels, image post
 | File | Purpose |
 |---|---|
 | `ig_download.py` | Core download engine. Works standalone as a CLI. |
-| `ig_gui.py` | Desktop GUI (tkinter). No extra dependencies. |
-| `ig_dashboard.html` | Standalone HTML log viewer. Open directly in a browser. |
+| `dashboard/` | Browser app. React source, built into `dashboard/dist`. |
+| `ig_dashboard.html` | Older single-file viewer, used only if the React build is missing. |
 | `example.txt` | Example URL file format. |
 | `requirements.txt` | Python dependencies (`yt-dlp`, `instaloader`). |
 | `requirements-dev.txt` | Test dependencies (`pytest`). |
@@ -39,7 +39,7 @@ For development and tests: `pip install -r requirements-dev.txt`
 
 The tool downloads **without cookies by default**. A `cookies.txt` is used only as a **fallback**: if a post cannot be downloaded because it is **age-restricted** or **private / login-gated**, that URL is retried once with your cookies. Public content never sends cookies.
 
-`--cookies-mode` (or the **Cookies mode** dropdown in the GUI) controls this:
+`--cookies-mode` (or **Cookies mode** on the Download tab) controls this:
 
 | Mode | Behaviour |
 |---|---|
@@ -57,15 +57,13 @@ To supply cookies, export a `cookies.txt` (Netscape format) using a browser exte
 
 ## Usage
 
-### GUI
+### Dashboard
 
 ```
-python ig_gui.py
+python ig_download.py --dashboard
 ```
 
-Fill in the URL file, collection name, an optional cookies file, the **output folder** and the **cookies mode**, then click **Start**. Downloads that authenticated with cookies are marked with a 🔑 in the log and in the Log Viewer tab.
-
-For discoverability, the **Help** menu (and the ❔ Help button) opens an About/Features overview, while the 📊 **Dashboard** and 📂 **Output folder** buttons open the HTML dashboard and the downloads folder. The Log Viewer tab adds a **Cookies 🔑** stat, a **cookies only** filter, and a right-click **Copy error** action.
+This opens the one app. The **Download** tab takes the URL list, collection name, output folder, cookies file, cookies mode, and filename template. Those paths are remembered in `ig_dashboard_settings.json` (gitignored) and filled in next time. **Instagram** shows the saved posts. **Log** is the filterable table. Start and Stop run on the Python process that is already serving the page.
 
 ### CLI
 
@@ -105,18 +103,18 @@ python ig_download.py my-saves.txt design --cookies cookies.txt
 - **Throttle protection** - explicit rate limits *and* the "Failed to parse JSON" response (Instagram serving HTML where JSON is expected) are backed off exponentially and retried; the run only aborts after several consecutive failures, saving progress first
 - **Retry failed** - re-run with `--retry-failed` to retry anything that previously failed
 - **Custom filename templates** - control how files are named using variables like `{shortcode}`, `{author}`, `{date}`, `{upload_date}`, `{index}`
-- **Custom output folder** - download into any base folder with `--output-dir` (the GUI has an **Output folder** field); each collection is created as a subfolder inside it
+- **Custom output folder** - download into any base folder with `--output-dir` or the Download tab; each collection is created as a subfolder inside it
 - **Cookie fallback** - cookies are kept out of the way until a post is age-restricted or private, then used automatically on retry
 - **Crash-safe logs** - writes are atomic (temp file + rename), and a corrupt log is moved aside to `*.corrupt-<timestamp>` instead of being overwritten
 - **Input validation** - collection names and filename templates are checked so they can never write outside the output folder
-- **Live progress** - real-time output in both the terminal and the GUI; 🔑 marks downloads that used cookies
+- **Live progress** - real-time output in the terminal and on the Download tab; 🔑 marks downloads that used cookies
 - **JSON log** - every download is logged with status, author, media type, file path, error detail, and whether cookies were used
 
 ---
 
 ## Filename templates
 
-The `--filename-template` option (or the template field in the GUI) controls the output filename. Available variables:
+The `--filename-template` option (or the template field on the Download tab) controls the output filename. Available variables:
 
 | Variable | Description |
 |---|---|
@@ -156,13 +154,9 @@ Covered: error classification, the cookie-fallback policy, Instagram URL/shortco
 
 ---
 
-## Log viewer (dashboard)
+## Library
 
-Open `ig_dashboard.html` directly in a browser. Click **Load JSON** (or drag and drop) to load one or more log files. The dashboard shows download stats — including **Cookies used**, **Cookie fallback** and **JSON throttle** counters — a filterable/sortable table, and a video preview modal. Rows that authenticated with cookies show a 🔑 next to their status.
-
-> **Note:** opening the page directly (`file://`) blocks automatic loading of `ig_logs_manifest.json`, because browsers disallow `fetch` on `file://`. Drag-and-drop and **Load JSON** still work. To auto-load the manifest, serve the folder, e.g. `python -m http.server`, then open `http://localhost:8000/ig_dashboard.html`.
-
-The log files are plain JSON (`<collection>.json`) written by `ig_download.py` to the same directory as the script. Multiple log files can be loaded and merged at once.
+`python ig_download.py --dashboard` serves the page on `127.0.0.1` and loads every collection log it can find. Each log is `<output>/<collection>/<collection>.json`, written beside the downloaded files. The Instagram grid and the Log tab both read those files. **Load JSON** can still merge an extra log by hand.
 
 ---
 
@@ -180,7 +174,7 @@ Requires [Tampermonkey](https://www.tampermonkey.net/). Once installed, navigate
 
 ## Notes
 
-- Downloads go to a `downloads/` folder next to the script by default; use `--output-dir` (or the GUI **Output folder** field) to change the base folder.
+- Downloads go to a `downloads/` folder next to the script by default; use `--output-dir` or the Download tab to change the base folder. The dashboard remembers that folder.
 - Instagram restricts access for non-authenticated requests. Cookies are only needed for age-restricted or private posts; for very large batches you can opt into `--cookies-mode always`.
 - This tool is for personal archival use. Respect Instagram's terms of service and the rights of content creators.
 

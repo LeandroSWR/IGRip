@@ -619,10 +619,266 @@ def ensure_video_poster(video_path):
     return None
 
 
+def dashboard_ui_root(script_dir=None):
+    """Built React app when it exists, otherwise the original HTML file."""
+    script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
+    dist = os.path.join(script_dir, "dashboard", "dist")
+    if os.path.isfile(os.path.join(dist, "index.html")):
+        return dist
+    return script_dir
+
+
+def dashboard_settings_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "ig_dashboard_settings.json")
+
+
+def default_dashboard_settings():
+    return {
+        "output_dir": "downloads",
+        "cookies": "",
+        "cookies_mode": COOKIES_MODE_FALLBACK,
+        "filename_template": "{shortcode}",
+        "url_file": "",
+    }
+
+
+def sanitize_dashboard_settings(data):
+    """Keep only the fields the dashboard is allowed to remember."""
+    if not isinstance(data, dict):
+        return {}
+    cleaned = {}
+    for key in ("output_dir", "cookies", "url_file"):
+        value = data.get(key)
+        if isinstance(value, str):
+            cleaned[key] = _resolve_user_path(value) if value.strip() else ""
+    template = data.get("filename_template")
+    if isinstance(template, str):
+        cleaned["filename_template"] = template.strip()
+    mode = data.get("cookies_mode")
+    if mode in COOKIES_MODES:
+        cleaned["cookies_mode"] = mode
+    if "filename_template" in cleaned:
+        try:
+            cleaned["filename_template"] = validate_filename_template(cleaned["filename_template"])
+        except ValueError:
+            cleaned.pop("filename_template", None)
+    return cleaned
+
+
+def load_dashboard_settings():
+    settings = default_dashboard_settings()
+    try:
+        with open(dashboard_settings_path(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return settings
+    settings.update(sanitize_dashboard_settings(data))
+    return settings
+
+
+def save_dashboard_settings(data):
+    """Remember download preferences. The output folder stays visible to the library."""
+    settings = load_dashboard_settings()
+    settings.update(sanitize_dashboard_settings(data))
+    path = dashboard_settings_path()
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(settings, fh, indent=2)
+    os.replace(tmp, path)
+    if settings.get("output_dir"):
+        remember_library_roots([settings["output_dir"]])
+    return settings
+
+
+def _resolve_user_path(path):
+    """Relative preferences are stored next to this script, as absolute paths."""
+    path = os.path.expanduser((path or "").strip())
+    if not path:
+        return ""
+    if not os.path.isabs(path):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+    return os.path.abspath(path)
+
+
+def browse_home():
+    """The furthest up the dashboard file picker is allowed to go."""
+    return os.path.realpath(os.path.expanduser("~"))
+
+
+def browse_directory(path=None):
+    """List folders and .txt files inside the user home directory.
+
+    The browser cannot see the disk. The Python process does, and this is the
+    only listing the Download tab is given. Cookie files are named, never read.
+    """
+    home = browse_home()
+    start = path or os.path.dirname(os.path.abspath(__file__))
+    full = os.path.realpath(start)
+    if os.path.isfile(full):
+        full = os.path.dirname(full)
+    if not path_is_under(full, [home]):
+        raise ValueError("That folder is outside your user folder.")
+    if not os.path.isdir(full):
+        raise ValueError("That path is not a folder.")
+    parent = os.path.dirname(full)
+    parent_ok = parent != full and path_is_under(parent, [home])
+    skip = {".git", "__pycache__", "node_modules", ".vscode", "venv", ".posters"}
+    dirs, files = [], []
+    try:
+        entries = list(os.scandir(full))
+    except OSError as exc:
+        raise ValueError("That folder could not be read.") from exc
+    for entry in entries:
+        if entry.name.startswith(".") or entry.name in skip:
+            continue
+        try:
+            is_dir = entry.is_dir(follow_symlinks=False)
+            is_file = entry.is_file(follow_symlinks=False)
+        except OSError:
+            continue
+        if is_dir:
+            dirs.append({"name": entry.name, "path": entry.path})
+        elif is_file and entry.name.lower().endswith(".txt"):
+            files.append({"name": entry.name, "path": entry.path})
+    dirs.sort(key=lambda item: item["name"].lower())
+    files.sort(key=lambda item: item["name"].lower())
+    return {
+        "path": full,
+        "parent": parent if parent_ok else None,
+        "dirs": dirs,
+        "files": files,
+    }
+
+
+class DownloadBusy(RuntimeError):
+    """A download is already running in this process."""
+
+
+def prepare_download_request(params):
+    """Validate a dashboard start request and remember the reusable fields."""
+    if not isinstance(params, dict):
+        raise ValueError("Expected a JSON object.")
+    url_file = (params.get("url_file") or "").strip()
+    if not url_file:
+        raise ValueError("Choose a URL file.")
+    collection = validate_collection(params.get("collection"))
+    output_dir = (params.get("output_dir") or "downloads").strip() or "downloads"
+    cookies = (params.get("cookies") or "").strip()
+    mode = params.get("cookies_mode") or COOKIES_MODE_FALLBACK
+    if mode not in COOKIES_MODES:
+        raise ValueError("Unknown cookies mode.")
+    template = validate_filename_template(params.get("filename_template") or "{shortcode}")
+    home = browse_home()
+
+    def inside_home(path, label, must_be_file):
+        full = _resolve_user_path(path)
+        if not path_is_under(full, [home]):
+            raise ValueError(f"{label} must stay inside your user folder.")
+        if must_be_file and not os.path.isfile(full):
+            raise ValueError(f"{label} was not found.")
+        return full
+
+    url_full = inside_home(url_file, "URL file", True)
+    if cookies:
+        cookies = inside_home(cookies, "Cookies file", True)
+    output_full = _resolve_user_path(output_dir)
+    if os.path.isdir(output_full):
+        if not path_is_under(output_full, [home]):
+            raise ValueError("Output folder must stay inside your user folder.")
+    else:
+        parent = os.path.dirname(output_full) or output_full
+        if not path_is_under(parent, [home]):
+            raise ValueError("Output folder must stay inside your user folder.")
+
+    save_dashboard_settings({
+        "url_file": url_full,
+        "output_dir": output_full,
+        "cookies": cookies,
+        "cookies_mode": mode,
+        "filename_template": template,
+    })
+    return {
+        "url_file": url_full,
+        "collection": collection,
+        "output_dir": output_full,
+        "cookies": cookies,
+        "cookies_mode": mode,
+        "filename_template": template,
+        "dry_run": bool(params.get("dry_run")),
+        "retry_failed": bool(params.get("retry_failed")),
+    }
+
+
+class DownloadJob:
+    """One background download. The dashboard polls status() for new events."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._stop = None
+        self._events = []
+        self._running = False
+
+    def status(self, since=0):
+        with self._lock:
+            try:
+                since = max(0, int(since))
+            except (TypeError, ValueError):
+                since = 0
+            return {
+                "running": self._running,
+                "events": list(self._events[since:]),
+                "next": len(self._events),
+            }
+
+    def _append(self, event):
+        with self._lock:
+            self._events.append(event)
+
+    def stop(self):
+        with self._lock:
+            stop = self._stop
+        if stop is not None:
+            stop.set()
+        return self.status()
+
+    def start(self, params):
+        prepared = prepare_download_request(params)
+        with self._lock:
+            if self._running:
+                raise DownloadBusy("A download is already running.")
+            self._events = []
+            self._running = True
+            self._stop = threading.Event()
+            stop = self._stop
+
+        def _run():
+            try:
+                run_download(
+                    url_file=prepared["url_file"],
+                    collection=prepared["collection"],
+                    cookies=prepared["cookies"] or None,
+                    cookies_mode=prepared["cookies_mode"],
+                    output_base=prepared["output_dir"],
+                    retry_failed=prepared["retry_failed"],
+                    dry_run=prepared["dry_run"],
+                    filename_template=prepared["filename_template"],
+                    progress_cb=self._append,
+                    stop_event=stop,
+                )
+            except Exception as exc:
+                self._append({"type": "error", "message": str(exc)})
+            finally:
+                with self._lock:
+                    self._running = False
+
+        threading.Thread(target=_run, name="ig-download-job", daemon=True).start()
+        return self.status()
+
+
 class _DashboardHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         server = args[2] if len(args) > 2 else kwargs.get("server")
-        super().__init__(*args, directory=server.web_root, **kwargs)
+        super().__init__(*args, directory=server.ui_root, **kwargs)
 
     def log_message(self, fmt, *args):
         return
@@ -633,6 +889,20 @@ class _DashboardHandler(SimpleHTTPRequestHandler):
             self.server.library_roots = library_roots()
             self._send_json({"collections": discover_collections(self.server.library_roots)})
             return
+        if parsed.path == "/api/settings":
+            self._send_json(load_dashboard_settings())
+            return
+        if parsed.path == "/api/browse":
+            raw = urllib.parse.parse_qs(parsed.query).get("path", [""])[0]
+            try:
+                self._send_json(browse_directory(raw or None))
+            except ValueError as exc:
+                self._send_error_json(400, str(exc))
+            return
+        if parsed.path == "/api/download/status":
+            since = urllib.parse.parse_qs(parsed.query).get("since", ["0"])[0]
+            self._send_json(self._job().status(since))
+            return
         if parsed.path == "/api/log":
             self._serve_allowed(parsed.query, kind="log")
             return
@@ -640,14 +910,73 @@ class _DashboardHandler(SimpleHTTPRequestHandler):
             self._serve_poster(parsed.query)
             return
         if parsed.path == "/api/media":
-            raw = urllib.parse.parse_qs(parsed.query).get("path", [""])[0]
-            if raw and path_is_under(raw, [self.server.web_root]):
-                rel = os.path.relpath(os.path.realpath(raw), self.server.web_root)
-                self.path = "/" + "/".join(urllib.parse.quote(part) for part in rel.split(os.sep))
-                return super().do_GET()
-            self._serve_allowed(parsed.query, kind="media")
+            self._serve_media(parsed.query)
             return
+        if parsed.path.startswith("/api/"):
+            self.send_error(404)
+            return
+        library_file = self._library_json(parsed.path)
+        if library_file:
+            self._stream_file(library_file, "application/json")
+            return
+        if not self._ui_file_exists(parsed.path):
+            self.path = "/index.html"
         return super().do_GET()
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        data = self._read_json()
+        if data is None:
+            return
+        if parsed.path == "/api/settings":
+            self._send_json(save_dashboard_settings(data))
+            return
+        if parsed.path == "/api/download":
+            try:
+                self._send_json(self._job().start(data))
+            except DownloadBusy as exc:
+                self._send_error_json(409, str(exc))
+            except ValueError as exc:
+                self._send_error_json(400, str(exc))
+            return
+        if parsed.path == "/api/download/stop":
+            self._send_json(self._job().stop())
+            return
+        self.send_error(404)
+
+    def _job(self):
+        if not hasattr(self.server, "job"):
+            self.server.job = DownloadJob()
+        return self.server.job
+
+    def _read_json(self):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._send_error_json(400, "Invalid request.")
+            return None
+        if length > 65536:
+            self._send_error_json(413, "Request is too large.")
+            return None
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            data = json.loads(raw.decode("utf-8") or "{}")
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._send_error_json(400, "Expected JSON.")
+            return None
+        if not isinstance(data, dict):
+            self._send_error_json(400, "Expected a JSON object.")
+            return None
+        return data
+
+    def _send_error_json(self, code, message):
+        body = json.dumps({"error": message}).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _send_json(self, payload):
         body = json.dumps(payload).encode("utf-8")
@@ -667,18 +996,89 @@ class _DashboardHandler(SimpleHTTPRequestHandler):
         if not poster:
             self.send_error(404)
             return
+        self._stream_file(poster, "image/jpeg", cache_control="public, max-age=86400")
+
+    def _library_json(self, url_path):
+        """A collection log lives beside its downloads, outside the React build."""
+        rel = urllib.parse.unquote(url_path).lstrip("/")
+        if not rel.lower().endswith(".json"):
+            return None
+        root = os.path.realpath(self.server.web_root)
+        candidate = os.path.realpath(os.path.join(root, rel))
         try:
-            with open(poster, "rb") as fh:
-                body = fh.read()
-        except OSError:
+            inside = os.path.commonpath([root, candidate]) == root
+        except ValueError:
+            return None
+        if not inside or not os.path.isfile(candidate):
+            return None
+        if not _looks_like_download_log(candidate):
+            return None
+        return candidate
+
+    def _ui_file_exists(self, url_path):
+        rel = urllib.parse.unquote(url_path).lstrip("/")
+        if not rel:
+            rel = "index.html"
+        candidate = os.path.realpath(os.path.join(self.server.ui_root, rel))
+        root = os.path.realpath(self.server.ui_root)
+        try:
+            inside = os.path.commonpath([root, candidate]) == root
+        except ValueError:
+            return False
+        return inside and os.path.isfile(candidate)
+
+    def _serve_media(self, query):
+        raw = urllib.parse.parse_qs(query).get("path", [""])[0]
+        if not raw or not path_is_under(raw, self.server.library_roots):
+            self.send_error(403)
+            return
+        full = os.path.realpath(raw)
+        if not os.path.isfile(full):
             self.send_error(404)
             return
-        self.send_response(200)
-        self.send_header("Content-Type", "image/jpeg")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "public, max-age=86400")
+        content_type = mimetypes.guess_type(full)[0] or "application/octet-stream"
+        self._stream_file(full, content_type)
+
+    def _stream_file(self, full, content_type, cache_control="no-store"):
+        file_size = os.path.getsize(full)
+        start, end = 0, file_size - 1
+        status = 200
+        range_header = self.headers.get("Range")
+        if range_header and range_header.startswith("bytes="):
+            spec = range_header.split("=", 1)[1].split(",")[0].strip()
+            left, _, right = spec.partition("-")
+            if left == "" and right:
+                start = max(file_size - int(right), 0)
+            else:
+                start = int(left or 0)
+                end = int(right) if right else file_size - 1
+            status = 206
+        start = max(0, start)
+        end = min(end, file_size - 1)
+        if start > end or start >= file_size:
+            self.send_error(416)
+            return
+        length = end - start + 1
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(length))
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+        self.send_header("Cache-Control", cache_control)
         self.end_headers()
-        self.wfile.write(body)
+        with open(full, "rb") as fh:
+            fh.seek(start)
+            remaining = length
+            while remaining:
+                chunk = fh.read(min(65536, remaining))
+                if not chunk:
+                    break
+                try:
+                    self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionAbortedError):
+                    return
+                remaining -= len(chunk)
 
     def _serve_allowed(self, query, kind):
         raw = urllib.parse.parse_qs(query).get("path", [""])[0]
@@ -728,7 +1128,9 @@ def ensure_dashboard_server(extra_roots=None, port=8765):
             if httpd is None:
                 raise bind_error
             httpd.web_root = script_dir
+            httpd.ui_root = dashboard_ui_root(script_dir)
             httpd.library_roots = roots
+            httpd.job = DownloadJob()
             thread = threading.Thread(target=httpd.serve_forever, name="ig-dashboard", daemon=True)
             thread.start()
             _dashboard_server = httpd
@@ -737,7 +1139,8 @@ def ensure_dashboard_server(extra_roots=None, port=8765):
                 if root not in _dashboard_server.library_roots:
                     _dashboard_server.library_roots.append(root)
         bound = _dashboard_server.server_address[1]
-    return f"http://127.0.0.1:{bound}/ig_dashboard.html"
+    page = "/" if os.path.basename(_dashboard_server.ui_root) == "dist" else "/ig_dashboard.html"
+    return f"http://127.0.0.1:{bound}{page}"
 
 
 # ---------------------------------------------------------------------------
