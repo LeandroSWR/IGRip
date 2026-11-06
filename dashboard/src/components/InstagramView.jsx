@@ -91,6 +91,8 @@ function Tile({ item, onOpen }) {
   const [broken, setBroken] = useState(false);
   const slides = slidePaths(item);
   const mark = isCarousel(item) ? `▦ ${slides.length}` : isImagePath(cover) ? "" : "▶";
+  const author = item.author || item.username || "";
+  const handle = author ? (author.startsWith("@") ? author : `@${author}`) : "";
 
   return (
     <button type="button" className="ig-tile" onClick={() => onOpen(item)}>
@@ -98,6 +100,12 @@ function Tile({ item, onOpen }) {
         <img src={tileUrl(cover)} alt="" loading="lazy" decoding="async" onError={() => setBroken(true)} />
       ) : (
         <span className="ig-fallback">{item.shortcode || "▶"}</span>
+      )}
+      {(handle || item.caption) && (
+        <span className="ig-hover">
+          {handle && <span className="ig-hover-author">{handle}</span>}
+          {item.caption && <span className="ig-hover-caption">{item.caption}</span>}
+        </span>
       )}
       {mark && <span className="ig-mark">{mark}</span>}
     </button>

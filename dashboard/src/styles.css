@@ -81,14 +81,29 @@ main { max-width: 1100px; margin: 0 auto; padding: 24px 20px 48px; }
 }
 .ig-name { font-size: 18px; font-weight: 700; }
 .ig-meta { color: var(--muted); font-size: 12px; }
-.ig-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 3px; }
+.ig-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
 .ig-tile {
-  position: relative; aspect-ratio: 1; background: #05050c; border: 0; padding: 0;
-  cursor: pointer; overflow: hidden;
+  position: relative; aspect-ratio: 3 / 4; background: #05050c; border: 0; padding: 0;
+  border-radius: 12px; cursor: pointer; overflow: hidden;
 }
 .ig-tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.ig-hover {
+  position: absolute; inset: 0; z-index: 1;
+  display: flex; flex-direction: column; justify-content: flex-end; gap: 4px;
+  padding: 16px 12px 12px; text-align: left; color: #fff; pointer-events: none;
+  background:
+    linear-gradient(to top, rgba(0,0,0,.82) 0%, rgba(0,0,0,.28) 36%, rgba(0,0,0,0) 58%),
+    radial-gradient(ellipse at center, rgba(0,0,0,0) 28%, rgba(0,0,0,.62) 100%);
+  opacity: 0; transition: opacity .16s ease;
+}
+.ig-tile:hover .ig-hover, .ig-tile:focus-visible .ig-hover { opacity: 1; }
+.ig-hover-author { font-size: 13px; font-weight: 700; }
+.ig-hover-caption {
+  font-size: 12px; line-height: 1.35; color: rgba(255,255,255,.92);
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden;
+}
 .ig-mark {
-  position: absolute; top: 8px; right: 8px; color: #fff;
+  position: absolute; top: 8px; right: 8px; z-index: 2; color: #fff;
   text-shadow: 0 1px 2px rgba(0,0,0,.8); pointer-events: none;
 }
 .ig-fallback {
@@ -197,4 +212,7 @@ th { color: var(--muted); font-size: 12px; }
   padding: 8px 10px; cursor: pointer;
 }
 .picker-list button:hover { background: var(--surf2); }
-@media (max-width: 720px) { .download-grid { grid-template-columns: 1fr; } }
+@media (max-width: 720px) {
+  .download-grid { grid-template-columns: 1fr; }
+  .ig-grid { grid-template-columns: repeat(2, 1fr); gap: 8px; }
+}
