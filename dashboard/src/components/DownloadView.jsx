@@ -57,6 +57,17 @@ function lineFor(event) {
   }
 }
 
+function CollectionCount({ item }) {
+  const have = item.saved ?? 0;
+  const failed = item.failed ?? 0;
+  return (
+    <div className="saved-count">
+      {have} downloaded
+      {failed > 0 && <span className="saved-failed"> · {failed} failed</span>}
+    </div>
+  );
+}
+
 export default function DownloadView({ onLibraryChanged }) {
   const [form, setForm] = useState(null);
   const [collection, setCollection] = useState("");
@@ -253,7 +264,7 @@ export default function DownloadView({ onLibraryChanged }) {
             <div className="saved-row" key={item.url}>
               <div>
                 <div className="saved-name">{item.name}</div>
-                {item.count != null && <div className="saved-count">{item.count} posts</div>}
+                <CollectionCount item={item} />
               </div>
               <button type="button" className="btn btn-primary" disabled={running || loadingSaved} onClick={() => downloadSaved(item)}>
                 Download

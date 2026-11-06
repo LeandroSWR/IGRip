@@ -159,6 +159,7 @@ th { color: var(--muted); font-size: 12px; }
 }
 .saved-name { font-weight: 650; }
 .saved-count { color: var(--muted); font-size: 12px; }
+.saved-failed { color: var(--red); }
 .download-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 16px; }
 .download-grid label, .download-options .check { display: grid; gap: 6px; color: var(--muted); font-size: 12px; }
 .download-grid input, .download-grid select {

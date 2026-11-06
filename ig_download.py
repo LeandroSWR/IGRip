@@ -540,7 +540,7 @@ def _log_href(path, web_root):
 
 
 def _dashboard_roots_file():
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "ig_dashboard_roots.json")
+    return os.path.join(_state_dir(), "ig_dashboard_roots.json")
 
 
 def remember_library_roots(extra_roots):
@@ -574,6 +574,9 @@ def remember_library_roots(extra_roots):
 def library_roots(extra_roots=None):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     roots = [script_dir]
+    data = configured_data_dir()
+    if data and data not in roots:
+        roots.append(data)
     roots.extend(remember_library_roots(extra_roots))
     for root in extra_roots or []:
         if root:
@@ -631,13 +634,45 @@ def dashboard_ui_root(script_dir=None):
     return script_dir
 
 
+_DATA_DIR = None
+
+
+def set_data_dir(path):
+    """Remember a dataset folder for this process. None clears the override."""
+    global _DATA_DIR
+    if not path:
+        _DATA_DIR = None
+        return
+    _DATA_DIR = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+
+
+def configured_data_dir():
+    """Dataset folder from --data-dir or IGRIP_DATA. Empty when unset."""
+    if _DATA_DIR:
+        return _DATA_DIR
+    raw = os.environ.get("IGRIP_DATA", "").strip()
+    if not raw:
+        return ""
+    return os.path.realpath(os.path.abspath(os.path.expanduser(raw)))
+
+
+def _state_dir():
+    """Where settings live. The dataset survives an image update; the script dir does not."""
+    data = configured_data_dir()
+    if data:
+        os.makedirs(data, exist_ok=True)
+        return data
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 def dashboard_settings_path():
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "ig_dashboard_settings.json")
+    return os.path.join(_state_dir(), "ig_dashboard_settings.json")
 
 
 def default_dashboard_settings():
+    data = configured_data_dir()
     return {
-        "output_dir": "downloads",
+        "output_dir": data or "downloads",
         "cookies": "",
         "cookies_mode": COOKIES_MODE_FALLBACK,
         "filename_template": "{shortcode}",
@@ -694,12 +729,13 @@ def save_dashboard_settings(data):
 
 
 def _resolve_user_path(path):
-    """Relative preferences are stored next to this script, as absolute paths."""
+    """Relative preferences sit in the data folder when one is set, otherwise beside this script."""
     path = os.path.expanduser((path or "").strip())
     if not path:
         return ""
     if not os.path.isabs(path):
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+        base = configured_data_dir() or os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(base, path)
     return os.path.abspath(path)
 
 
@@ -708,23 +744,44 @@ def browse_home():
     return os.path.realpath(os.path.expanduser("~"))
 
 
+def storage_roots():
+    """Folders the app may read and write: the user home, plus the NAS dataset."""
+    roots = [browse_home()]
+    data = configured_data_dir()
+    if data and data not in roots:
+        roots.append(data)
+    return roots
+
+
+def _require_storage_dir(path, label):
+    """Allow a folder under the user home or the data folder, even if it is not created yet."""
+    if os.path.isdir(path):
+        allowed = path_is_under(path, storage_roots())
+    else:
+        parent = os.path.dirname(path) or path
+        allowed = path_is_under(parent, storage_roots())
+    if not allowed:
+        raise ValueError(f"{label} must stay inside your user folder or the data folder.")
+    return path
+
+
 def browse_directory(path=None):
-    """List folders and .txt files inside the user home directory.
+    """List folders and .txt files inside the user home or the data folder.
 
     The browser cannot see the disk. The Python process does, and this is the
     only listing the Download tab is given. Cookie files are named, never read.
     """
-    home = browse_home()
-    start = path or os.path.dirname(os.path.abspath(__file__))
+    roots = storage_roots()
+    start = path or configured_data_dir() or os.path.dirname(os.path.abspath(__file__))
     full = os.path.realpath(start)
     if os.path.isfile(full):
         full = os.path.dirname(full)
-    if not path_is_under(full, [home]):
-        raise ValueError("That folder is outside your user folder.")
+    if not path_is_under(full, roots):
+        raise ValueError("That folder is outside your user folder or the data folder.")
     if not os.path.isdir(full):
         raise ValueError("That path is not a folder.")
     parent = os.path.dirname(full)
-    parent_ok = parent != full and path_is_under(parent, [home])
+    parent_ok = parent != full and path_is_under(parent, roots)
     skip = {".git", "__pycache__", "node_modules", ".vscode", "venv", ".posters"}
     dirs, files = [], []
     try:
@@ -907,6 +964,49 @@ def collection_folder_name(name):
     return validate_collection(cleaned)
 
 
+def _downloaded_counts(roots):
+    """How many posts each collection folder already has, by folder name."""
+    counts = {}
+    for collection in discover_collections(roots):
+        seen = set()
+        saved = failed = 0
+        for path in collection.get("abs_logs") or []:
+            log = load_log(path)
+            for item in log.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                key = item.get("url") or item.get("shortcode")
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                status = item.get("status")
+                if status == "ok":
+                    saved += 1
+                elif status == "failed":
+                    failed += 1
+        name = (collection.get("name") or "").casefold()
+        if not name:
+            continue
+        bucket = counts.setdefault(name, {"saved": 0, "failed": 0})
+        bucket["saved"] += saved
+        bucket["failed"] += failed
+    return counts
+
+
+def annotate_collection_counts(collections, roots):
+    """Add how many posts we already have next to Instagram's count."""
+    counts = _downloaded_counts(roots)
+    for item in collections or []:
+        try:
+            folder = collection_folder_name(item.get("name") or "")
+        except ValueError:
+            folder = ""
+        found = counts.get(folder.casefold(), {})
+        item["saved"] = found.get("saved", 0)
+        item["failed"] = found.get("failed", 0)
+    return collections
+
+
 def is_saved_collection_url(url):
     parsed = urllib.parse.urlparse((url or "").strip())
     if parsed.scheme != "https" or parsed.netloc.lower() not in ("www.instagram.com", "instagram.com"):
@@ -920,8 +1020,8 @@ def require_cookies_file():
     cookies = settings.get("cookies") or ""
     if not cookies or not os.path.isfile(cookies):
         raise ValueError("Choose a cookies file first.")
-    if not path_is_under(cookies, [browse_home()]):
-        raise ValueError("Cookies file must stay inside your user folder.")
+    if not path_is_under(cookies, storage_roots()):
+        raise ValueError("Cookies file must stay inside your user folder or the data folder.")
     return cookies, settings
 
 
@@ -1050,6 +1150,75 @@ def _close_instagram(pw, browser):
         pass
 
 
+_VISIBLE_POSTS_JS = r"""
+() => {
+  const found = [];
+  const seen = new Set();
+  for (const anchor of document.querySelectorAll('a[href]')) {
+    const match = (anchor.getAttribute('href') || '').match(/\/(p|reel)\/([A-Za-z0-9_-]+)/);
+    if (!match || seen.has(match[2])) continue;
+    seen.add(match[2]);
+    found.push([match[1], match[2]]);
+  }
+  let best = document.scrollingElement || document.body;
+  let room = 0;
+  const nodes = [document.scrollingElement, document.body, ...document.querySelectorAll('div')];
+  for (const node of nodes) {
+    if (!node) continue;
+    const extra = node.scrollHeight - node.clientHeight;
+    if (extra > room) {
+      room = extra;
+      best = node;
+    }
+  }
+  best.scrollTop = (best.scrollTop || 0) + Math.max((best.clientHeight || 700) * 0.85, 600);
+  window.scrollTo(0, document.body.scrollHeight);
+  return found;
+}
+"""
+
+
+def _gather_post_urls(page, max_steps=80, on_count=None, stop_event=None):
+    """Collect post links while scrolling.
+
+    Instagram removes links that scroll off screen, so each pass is merged
+    into the posts already seen. The count therefore only stays or grows.
+    """
+    if looks_like_login(page.url, ""):
+        raise SavedPageError(_LOGIN_AGAIN)
+    seen = set()
+    urls = []
+    last = None
+    idle = 0
+    for step in range(max_steps):
+        if stop_event is not None and stop_event.is_set():
+            break
+        if looks_like_login(page.url, ""):
+            raise SavedPageError(_LOGIN_AGAIN, urls)
+        for pair in page.evaluate(_VISIBLE_POSTS_JS) or []:
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                continue
+            kind, code = pair
+            if kind not in ("p", "reel") or not code or code in seen:
+                continue
+            seen.add(code)
+            urls.append(f"https://www.instagram.com/{kind}/{code}/")
+        count = len(urls)
+        if on_count and count != last:
+            on_count(count)
+        if count == last:
+            idle += 1
+            if idle >= 3 and (count > 0 or step >= 6):
+                break
+        else:
+            idle = 0
+            last = count
+        page.wait_for_timeout(400)
+    if looks_like_login(page.url, ""):
+        raise SavedPageError(_LOGIN_AGAIN, urls)
+    return urls
+
+
 def list_saved_collections():
     """Open the saved page and return the collection names and links on it."""
     cookies, _settings = require_cookies_file()
@@ -1093,15 +1262,15 @@ def collect_collection_posts(cookies_file, collection_url, stop_event=None, prog
             page.goto(collection_url, wait_until="domcontentloaded", timeout=45000)
             page.wait_for_timeout(1500)
 
-            def on_step(urls):
+            def on_count(count):
                 if progress_cb:
                     progress_cb({
                         "type": "collecting",
-                        "found": len(urls),
-                        "message": f"Reading the collection… {len(urls)} posts",
+                        "found": count,
+                        "message": f"Reading the collection… {count} posts",
                     })
 
-            return _scroll_collect(page, parse_post_urls, stop_event=stop_event, on_step=on_step)
+            return _gather_post_urls(page, on_count=on_count, stop_event=stop_event)
         finally:
             _close_instagram(pw, browser)
 
@@ -1128,14 +1297,7 @@ def prepare_saved_download(params):
     if not is_saved_collection_url(url):
         raise ValueError("That is not a saved collection link.")
     output_full = _resolve_user_path(settings.get("output_dir") or "downloads")
-    home = browse_home()
-    if os.path.isdir(output_full):
-        if not path_is_under(output_full, [home]):
-            raise ValueError("Output folder must stay inside your user folder.")
-    else:
-        parent = os.path.dirname(output_full) or output_full
-        if not path_is_under(parent, [home]):
-            raise ValueError("Output folder must stay inside your user folder.")
+    _require_storage_dir(output_full, "Output folder")
     template = validate_filename_template(settings.get("filename_template") or "{shortcode}")
     retry = params.get("retry_failed", True)
     return {
@@ -1166,27 +1328,20 @@ def prepare_download_request(params):
     if mode not in COOKIES_MODES:
         raise ValueError("Unknown cookies mode.")
     template = validate_filename_template(params.get("filename_template") or "{shortcode}")
-    home = browse_home()
 
-    def inside_home(path, label, must_be_file):
+    def inside_storage(path, label, must_be_file):
         full = _resolve_user_path(path)
-        if not path_is_under(full, [home]):
-            raise ValueError(f"{label} must stay inside your user folder.")
+        if not path_is_under(full, storage_roots()):
+            raise ValueError(f"{label} must stay inside your user folder or the data folder.")
         if must_be_file and not os.path.isfile(full):
             raise ValueError(f"{label} was not found.")
         return full
 
-    url_full = inside_home(url_file, "URL file", True)
+    url_full = inside_storage(url_file, "URL file", True)
     if cookies:
-        cookies = inside_home(cookies, "Cookies file", True)
+        cookies = inside_storage(cookies, "Cookies file", True)
     output_full = _resolve_user_path(output_dir)
-    if os.path.isdir(output_full):
-        if not path_is_under(output_full, [home]):
-            raise ValueError("Output folder must stay inside your user folder.")
-    else:
-        parent = os.path.dirname(output_full) or output_full
-        if not path_is_under(parent, [home]):
-            raise ValueError("Output folder must stay inside your user folder.")
+    _require_storage_dir(output_full, "Output folder")
 
     save_dashboard_settings({
         "url_file": url_full,
@@ -1365,7 +1520,9 @@ class _DashboardHandler(SimpleHTTPRequestHandler):
                 self._send_error_json(409, "A download is already running.")
                 return
             try:
-                self._send_json(list_saved_collections())
+                payload = list_saved_collections()
+                annotate_collection_counts(payload.get("collections"), library_roots())
+                self._send_json(payload)
             except ValueError as exc:
                 self._send_error_json(400, str(exc))
             return
@@ -1584,18 +1741,50 @@ class _DashboardHandler(SimpleHTTPRequestHandler):
             fh.close()
 
 
-def ensure_dashboard_server(extra_roots=None, port=8765):
-    """Serve the dashboard and collection logs on localhost. Returns the page URL."""
+def dashboard_listen_host(host=None):
+    """Listen address for the dashboard. Localhost unless --host or IGRIP_HOST says otherwise."""
+    raw = host if host is not None else os.environ.get("IGRIP_HOST", "")
+    raw = (raw or "127.0.0.1").strip()
+    return raw or "127.0.0.1"
+
+
+def _local_lan_ip():
+    """An address other devices on the LAN can open. Empty when none is known."""
+    import socket
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect(("192.0.2.1", 1))
+            ip = sock.getsockname()[0]
+        finally:
+            sock.close()
+    except OSError:
+        return ""
+    if not ip or ip.startswith("127."):
+        return ""
+    return ip
+
+
+def dashboard_page_url(host, port, page):
+    shown = host
+    if host in ("0.0.0.0", "::"):
+        shown = _local_lan_ip() or "127.0.0.1"
+    return f"http://{shown}:{port}{page}"
+
+
+def ensure_dashboard_server(extra_roots=None, port=8765, host=None):
+    """Serve the dashboard and collection logs. Returns the page URL."""
     global _dashboard_server
     script_dir = os.path.dirname(os.path.abspath(__file__))
     roots = library_roots(extra_roots)
+    bind_host = dashboard_listen_host(host)
     with _dashboard_lock:
         if _dashboard_server is None:
             httpd = None
             bind_error = None
             for candidate in range(port, port + 10):
                 try:
-                    httpd = ThreadingHTTPServer(("127.0.0.1", candidate), _DashboardHandler)
+                    httpd = ThreadingHTTPServer((bind_host, candidate), _DashboardHandler)
                     break
                 except OSError as exc:
                     bind_error = exc
@@ -1613,8 +1802,9 @@ def ensure_dashboard_server(extra_roots=None, port=8765):
                 if root not in _dashboard_server.library_roots:
                     _dashboard_server.library_roots.append(root)
         bound = _dashboard_server.server_address[1]
+        bound_host = _dashboard_server.server_address[0]
     page = "/" if os.path.basename(_dashboard_server.ui_root) == "dist" else "/ig_dashboard.html"
-    return f"http://127.0.0.1:{bound}{page}"
+    return dashboard_page_url(bound_host, bound, page)
 
 
 # ---------------------------------------------------------------------------
@@ -2431,6 +2621,10 @@ def main():
     parser.add_argument("--output-dir", default="downloads", metavar="DIR",
                         help=("Base folder for downloads (default: downloads). "
                               "Each collection is created as a subfolder."))
+    parser.add_argument("--host", default=None,
+                        help="Dashboard listen address. Default 127.0.0.1. Use 0.0.0.0 on the NAS, or set IGRIP_HOST.")
+    parser.add_argument("--data-dir", default=None, metavar="DIR",
+                        help="Folder for the library, cookies, and saved settings. Or set IGRIP_DATA.")
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--filename-template", default="{shortcode}",
@@ -2442,13 +2636,17 @@ def main():
                             "Example: --filename-template '{author}_{shortcode}'"
                         ))
     args = parser.parse_args()
+    if args.data_dir:
+        set_data_dir(args.data_dir)
 
     if args.dashboard:
         import webbrowser
-        url = ensure_dashboard_server(extra_roots=[args.output_dir])
+        host = dashboard_listen_host(args.host)
+        url = ensure_dashboard_server(extra_roots=[args.output_dir], host=host)
         print(f"Dashboard: {url}")
         print("Press Ctrl+C to stop.", flush=True)
-        webbrowser.open(url)
+        if host in ("127.0.0.1", "::1", "localhost"):
+            webbrowser.open(url)
         _install_ctrl_c_exit()
         try:
             # Event.wait() never wakes for Ctrl+C on Windows. sleep() does.

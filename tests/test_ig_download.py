@@ -397,6 +397,61 @@ def test_settings_roundtrip_keeps_known_fields():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_dashboard_host_stays_local_until_asked():
+    with mock.patch.dict(os.environ, {"IGRIP_HOST": ""}, clear=False):
+        assert ig.dashboard_listen_host(None) == "127.0.0.1"
+    with mock.patch.dict(os.environ, {"IGRIP_HOST": "0.0.0.0"}):
+        assert ig.dashboard_listen_host(None) == "0.0.0.0"
+    assert ig.dashboard_listen_host("192.168.1.20") == "192.168.1.20"
+    url = ig.dashboard_page_url("0.0.0.0", 8765, "/")
+    assert url.startswith("http://")
+    assert url.endswith(":8765/")
+    assert "0.0.0.0" not in url
+
+
+def test_data_dir_reads_a_dataset_outside_the_user_home():
+    d = tempfile.mkdtemp(prefix="igdl_data_")
+    home = os.path.join(d, "home")
+    dataset = os.path.join(d, "dataset")
+    folder = os.path.join(dataset, "Haircut")
+    os.makedirs(home)
+    os.makedirs(folder)
+    with open(os.path.join(folder, "Haircut.json"), "w", encoding="utf-8") as fh:
+        json.dump({"items": [{"url": "https://www.instagram.com/p/aaa/", "status": "ok"}]}, fh)
+    url_file = os.path.join(dataset, "posts.txt")
+    with open(url_file, "w", encoding="utf-8") as fh:
+        fh.write("https://www.instagram.com/p/aaa/\n")
+    elsewhere = os.path.join(d, "elsewhere")
+    os.makedirs(elsewhere)
+    try:
+        ig.set_data_dir(dataset)
+        with mock.patch.object(ig, "browse_home", return_value=os.path.realpath(home)):
+            found = ig.discover_collections(ig.library_roots())
+            assert any(
+                os.path.realpath(item["dir"]).startswith(os.path.realpath(dataset))
+                for item in found
+            )
+            listing = ig.browse_directory(dataset)
+            assert [item["name"] for item in listing["files"]] == ["posts.txt"]
+            prepared = ig.prepare_download_request({
+                "url_file": url_file,
+                "collection": "Haircut",
+                "output_dir": os.path.join(dataset, "library"),
+            })
+            assert os.path.basename(prepared["output_dir"]) == "library"
+            assert ig._resolve_user_path("library").startswith(os.path.realpath(dataset))
+            assert ig.dashboard_settings_path().startswith(os.path.realpath(dataset))
+            _expect_raises(ValueError, ig.browse_directory, elsewhere)
+            _expect_raises(ValueError, ig.prepare_download_request, {
+                "url_file": url_file,
+                "collection": "Haircut",
+                "output_dir": elsewhere,
+            })
+    finally:
+        ig.set_data_dir(None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_browse_lists_txt_and_rejects_outside_home():
     d = tempfile.mkdtemp(prefix="igdl_browse_")
     home = os.path.join(d, "home")
@@ -500,6 +555,61 @@ def test_saved_page_parser_reads_profile_collections_and_posts():
         "https://www.instagram.com/p/AbCdEfGhIj/",
         "https://www.instagram.com/reel/ZzYyXxWwVv/",
     ]
+
+
+def test_gather_post_urls_keeps_posts_that_scroll_away():
+    class Page:
+        def __init__(self):
+            self.url = "https://www.instagram.com/jane.doe/saved/haircut/1/"
+            self.calls = 0
+            self.batches = [
+                [["reel", "aaaaa"], ["p", "bbbbb"]],
+                [["p", "ccccc"]],
+                [["p", "ccccc"]],
+                [["p", "ccccc"]],
+                [["p", "ccccc"]],
+            ]
+
+        def evaluate(self, script):
+            batch = self.batches[min(self.calls, len(self.batches) - 1)]
+            self.calls += 1
+            return batch
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+    seen = []
+    urls = ig._gather_post_urls(Page(), on_count=seen.append)
+    assert urls == [
+        "https://www.instagram.com/reel/aaaaa/",
+        "https://www.instagram.com/p/bbbbb/",
+        "https://www.instagram.com/p/ccccc/",
+    ]
+    assert seen == [2, 3]
+
+
+def test_saved_collection_counts_compare_with_the_library():
+    d = tempfile.mkdtemp(prefix="igdl_counts_")
+    folder = os.path.join(d, "Haircut")
+    os.makedirs(folder)
+    with open(os.path.join(folder, "Haircut.json"), "w", encoding="utf-8") as fh:
+        json.dump({"items": [
+            {"url": "https://www.instagram.com/p/aaa/", "status": "ok"},
+            {"url": "https://www.instagram.com/p/bbb/", "status": "ok"},
+            {"url": "https://www.instagram.com/p/ccc/", "status": "failed"},
+        ]}, fh)
+    try:
+        collections = [
+            {"name": "haircut", "count": 9},
+            {"name": "Empty shelf", "count": 2},
+        ]
+        ig.annotate_collection_counts(collections, [d])
+        assert collections[0]["saved"] == 2
+        assert collections[0]["failed"] == 1
+        assert collections[1]["saved"] == 0
+        assert collections[1]["failed"] == 0
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def test_saved_collection_url_and_folder_name():
