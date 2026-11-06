@@ -1,230 +1,160 @@
-# igdl
+# IG RIP
 
-![igdl screenshot](https://i.imgur.com/zeTc3GH.png)
+IG RIP is a personal Instagram library. It downloads posts, reels, images, and carousels, then shows them in a browser dashboard that runs from the same Python process.
 
-A desktop tool for batch-downloading Instagram posts - videos, reels, image posts, and carousels - from a plain list of URLs. The browser dashboard is the app: it starts downloads, remembers your folders, and shows the library. A CLI remains for scripts.
+This project started from [IGbulkDL](https://github.com/doncezart/IGbulkDL) by [Don Cezar](https://github.com/doncezart). Reading a saved collection follows the same idea as his Tampermonkey script, [IG Bulk Collector](https://github.com/doncezart/IGbulkCollector): open the page while logged in, scroll, and collect the post and reel links. IG RIP does that inside the dashboard. The userscript is still useful for Explore or someone else's profile.
 
 ---
 
-## Files
+## What you get
 
-| File | Purpose |
-|---|---|
-| `ig_download.py` | Core download engine. Works standalone as a CLI. |
-| `dashboard/` | Browser app. React source, built into `dashboard/dist`. |
-| `ig_dashboard.html` | Older single-file viewer, used only if the React build is missing. |
-| `example.txt` | Example URL file format. |
-| `requirements.txt` | Python dependencies (`yt-dlp`, `instaloader`). |
-| `requirements-dev.txt` | Test dependencies (`pytest`). |
-| `tests/` | Pytest suite for the core logic (no network needed). |
-| `.gitignore` | Keeps cookies, sessions, logs and downloads out of git. |
-| `LICENSE` | MIT license. |
+The dashboard has three views:
+
+- **Instagram** shows downloaded posts as a grid. Videos use a still frame, so the page does not load every file at once. A carousel lives in one folder named with the post's shortcode.
+- **Log** is a filterable table of the same posts.
+- **Download** starts a run, remembers your folders and cookies file, and can pull one saved collection at a time.
+
+A command-line run is still there for a URL list you already have.
+
+---
+
+## Credit
+
+- [Don Cezar](https://github.com/doncezart) created [IGbulkDL](https://github.com/doncezart/IGbulkDL), the downloader this project started from.
+- He also created [IG Bulk Collector](https://github.com/doncezart/IGbulkCollector), the original Tampermonkey bulk post collector.
 
 ---
 
 ## Requirements
 
-- **Python 3.10+** (required by current `yt-dlp`; `instaloader` needs 3.9+)
-- [yt-dlp](https://github.com/yt-dlp/yt-dlp)
-- [instaloader](https://github.com/instaloader/instaloader)
-- [ffmpeg](https://ffmpeg.org/download.html) on your `PATH` — yt-dlp needs it to merge best video + audio. Without it, video/reel downloads may be single-stream or fail; the tool warns at startup.
-
-```
-pip install -r requirements.txt
-```
-
-For development and tests: `pip install -r requirements-dev.txt`
-
-### Authentication
-
-The tool downloads **without cookies by default**. A `cookies.txt` is used only as a **fallback**: if a post cannot be downloaded because it is **age-restricted** or **private / login-gated**, that URL is retried once with your cookies. Public content never sends cookies.
-
-`--cookies-mode` (or **Cookies mode** on the Download tab) controls this:
-
-| Mode | Behaviour |
-|---|---|
-| `fallback` (default) | Try without cookies; retry with cookies only for age/private restricted posts |
-| `always` | Send cookies on every request (e.g. to reduce rate-limiting on huge batches) |
-| `never` | Ignore the cookies file entirely |
-
-Cookies work for both downloaders: **yt-dlp** (videos, reels, carousels) and **instaloader** (image posts).
-
-To supply cookies, export a `cookies.txt` (Netscape format) using a browser extension such as [Get cookies.txt LOCALLY](https://chrome.google.com/webstore/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc), then pass it with `--cookies`.
-
-> Treat `cookies.txt` as a password — anyone who has it can access your account. Never commit or share it. Every download result is tagged `used_cookies` / `cookie_fallback` in the JSON log so you can see exactly when they were used.
-
----
-
-## Usage
-
-### Dashboard
-
-```
-python ig_download.py --dashboard
-```
-
-This opens the one app. The **Download** tab takes the URL list, collection name, output folder, cookies file, cookies mode, and filename template. Those paths are remembered in `ig_dashboard_settings.json` (gitignored) and filled in next time. **Instagram** shows the saved posts. **Log** is the filterable table. Start and Stop run on the Python process that is already serving the page.
-
-### CLI
-
-```
-python ig_download.py <url-file> <collection-name> [options]
-```
-
-```
-positional arguments:
-  url_file              Path to a .txt file with one Instagram URL per line
-  collection            Name for this collection (used as the log file name)
-
-options:
-  --cookies FILE        Path to a cookies.txt file
-  --cookies-mode MODE   fallback (default) | always | never
-  --output-dir DIR      Base folder for downloads (default: downloads)
-  --log FILE            Override the log file path (default: <collection>.json)
-  --filename-template T Filename template for saved files (default: {shortcode})
-  --retry-failed        Re-attempt URLs previously logged as failed
-  --dry-run             Extract metadata only, do not download
-```
-
-**Example:**
-
-```
-python ig_download.py my-saves.txt design --cookies cookies.txt
-```
-
----
-
-## Features
-
-- **Videos and reels** - downloaded via yt-dlp (best quality, merged to mp4)
-- **Image posts** - downloaded via instaloader
-- **Carousels** - yt-dlp handles mixed video/image carousels; falls back to instaloader for image-only carousels
-- **Skip duplicates** - already-downloaded posts are skipped automatically (by log and by disk check)
-- **Throttle protection** - explicit rate limits *and* the "Failed to parse JSON" response (Instagram serving HTML where JSON is expected) are backed off exponentially and retried; the run only aborts after several consecutive failures, saving progress first
-- **Retry failed** - re-run with `--retry-failed` to retry anything that previously failed
-- **Custom filename templates** - control how files are named using variables like `{shortcode}`, `{author}`, `{date}`, `{upload_date}`, `{index}`
-- **Custom output folder** - download into any base folder with `--output-dir` or the Download tab; each collection is created as a subfolder inside it
-- **Cookie fallback** - cookies are kept out of the way until a post is age-restricted or private, then used automatically on retry
-- **Crash-safe logs** - writes are atomic (temp file + rename), and a corrupt log is moved aside to `*.corrupt-<timestamp>` instead of being overwritten
-- **Input validation** - collection names and filename templates are checked so they can never write outside the output folder
-- **Live progress** - real-time output in the terminal and on the Download tab; 🔑 marks downloads that used cookies
-- **JSON log** - every download is logged with status, author, media type, file path, error detail, and whether cookies were used
-
----
-
-## Filename templates
-
-The `--filename-template` option (or the template field on the Download tab) controls the output filename. Available variables:
-
-| Variable | Description |
-|---|---|
-| `{shortcode}` | Instagram post shortcode (default) |
-| `{author}` | Uploader username |
-| `{title}` | Post title as reported by yt-dlp |
-| `{upload_date}` | Original upload date (`YYYYMMDD`) |
-| `{date}` | Today's date (`YYYY-MM-DD`) |
-| `{index}` | Sequential position in the current run |
-| `{index:04d}` | Zero-padded index (width 4) |
-
-Examples:
-
-```
-{shortcode}                          →  DYFgyOEuIRN.mp4
-{author}_{shortcode}                 →  natgeo_DYFgyOEuIRN.mp4
-{date}_{index:04d}_{shortcode}       →  2026-05-18_0001_DYFgyOEuIRN.mp4
-```
-
----
-
-## Tests
-
-The core logic has a small pytest suite (no network required):
-
-```
-python -m pytest tests -q
-```
-
-It also runs with plain Python:
-
-```
-python tests/test_ig_download.py
-```
-
-Covered: error classification, the cookie-fallback policy, Instagram URL/shortcode parsing, path-traversal validation, and atomic/corruption-safe log handling.
-
----
-
-## Library
-
-`python ig_download.py --dashboard` serves the page on `127.0.0.1` and loads every collection log it can find. Each log is `<output>/<collection>/<collection>.json`, written beside the downloaded files. The Instagram grid and the Log tab both read those files. **Load JSON** can still merge an extra log by hand.
-
----
-
-## Extensions
-
-### Saved collections
-
-On the Download tab, **Refresh** opens your saved page with the cookies file and lists the collections shown there. **Download** on a row reads every post and reel link from that collection's page, writes `Collections/<name>.txt`, and starts the download into the saved output folder. Cookies are sent with every post in that run.
-
-The first time you use it, install the page reader:
+- Python 3.10+
+- ffmpeg on `PATH`, so yt-dlp can merge video and audio and the grid can make stills
+- The Python packages in `requirements.txt`: yt-dlp, instaloader, and Playwright
 
 ```
 pip install -r requirements.txt
 python -m playwright install chromium
 ```
 
-### IG Link Collector (Tampermonkey userscript)
+Playwright's Chromium is only needed for **Refresh** and **Download** on a saved collection. A URL-file download does not open a browser.
 
-The userscript is still there for Explore or someone else's profile. Saved collections no longer need it.
+For tests: `pip install -r requirements-dev.txt`
 
-**Install:** [IG Link Collector](https://github.com/doncezart/IGbulkCollector)
+Node is only needed if you change the React page in `dashboard/src` and rebuild `dashboard/dist`. The running app does not use Node. The server opens `dashboard/dist` when that build is present, and falls back to `ig_dashboard.html` when it is not.
 
-Requires [Tampermonkey](https://www.tampermonkey.net/). Once installed, open a feed on Instagram. A small control panel appears in the corner. Hit **Start** and let it scroll; when done, click **Export** to download the URL list.
+---
+
+## Dashboard
+
+```
+python ig_download.py --dashboard
+```
+
+On this PC that listens on `127.0.0.1`, port 8765 (or the next free port up to 8774), and opens the page. Press Ctrl+C in that console to stop it.
+
+The Download tab remembers the output folder, cookies file, cookies mode, filename template, and last URL file in `ig_dashboard_settings.json`. That file is gitignored. **Retry previously failed** starts checked. Dry run starts unchecked.
+
+**Refresh** on Saved collections opens your Instagram saved page with the cookies file and lists each collection. Next to the name it shows how many posts from that collection are already in the library. **Download** on a row scrolls that collection, writes `Collections/<name>.txt`, and downloads into `<output>/<name>/`. Cookies are sent for every post in a saved-collection run. The log for a collection is `<output>/<name>/<name>.json`, beside the files.
+
+---
+
+## Cookies
+
+Export a Netscape `cookies.txt` while logged into instagram.com. The extension [Get cookies.txt LOCALLY](https://chrome.google.com/webstore/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) can do that. The file must include the `sessionid` cookie.
+
+| Mode | Behaviour |
+|---|---|
+| `fallback` (default) | Try without cookies. Send them only when a post is age-restricted or private. |
+| `always` | Send cookies on every request. |
+| `never` | Ignore the cookies file. |
+
+A saved-collection download always sends cookies, because that page is only visible while logged in.
+
+Treat `cookies.txt` as the account password. Anyone with it can use the account. Never commit it, paste it into a chat, or attach it to an issue. If it leaks, log out of Instagram everywhere and export a new file.
+
+---
+
+## CLI
+
+```
+python ig_download.py <url-file> <collection-name> [options]
+```
+
+```
+--cookies FILE         Path to cookies.txt
+--cookies-mode MODE    fallback (default) | always | never
+--output-dir DIR       Base folder (default: downloads). Each collection is a subfolder.
+--log FILE             Override the log path
+--filename-template T  Saved filename (default: {shortcode})
+--retry-failed         Try URLs that previously failed
+--dry-run              Read the post only, do not download
+--host ADDR            Dashboard listen address (default: 127.0.0.1)
+--data-dir DIR         Folder for the library, cookies, and settings
+```
+
+```
+python ig_download.py my-saves.txt design --cookies cookies.txt
+```
+
+One URL per line. Blank lines and lines starting with `#` are ignored. See `example.txt`.
+
+---
+
+## How posts are saved
+
+- Videos and reels go through yt-dlp and are merged to mp4 when ffmpeg is available.
+- A single image goes through instaloader.
+- A carousel is a folder named with the shortcode. Video slides are downloaded by yt-dlp. Photo slides are saved from the images yt-dlp already listed for that post. Posts that were already saved are skipped. `--retry-failed` tries the ones that failed.
+- The log records status, author, media type, path, and whether cookies were used. Writes are atomic. A log that cannot be parsed is moved aside instead of being overwritten.
+
+Filename variables:
+
+| Variable | Meaning |
+|---|---|
+| `{shortcode}` | Post shortcode |
+| `{author}` | Uploader username |
+| `{title}` | Title reported for the post |
+| `{upload_date}` | Upload date, `YYYYMMDD` |
+| `{date}` | Today's date, `YYYY-MM-DD` |
+| `{index}` | Position in this run |
+| `{index:04d}` | That position, zero-padded |
+
+---
+
+## Home server
+
+The dashboard can listen on the LAN and store the library on another disk. On this PC, leave these unset.
+
+```
+IGRIP_HOST=0.0.0.0
+IGRIP_DATA=/data
+python ig_download.py --dashboard
+```
+
+`--host` and `--data-dir` do the same thing. `IGRIP_DATA` is the folder the app may read and write in addition to your user home: downloads, cookies, URL lists, and settings. The library scan includes it, so collections on that disk show up in the grid. Relative paths are placed inside it. The printed address is a LAN address other devices can open, and the process does not try to launch a browser.
+
+There is no login on the page. Do not publish that port past your home network. Anyone who can open it can see the library and start a download with the cookies file.
+
+---
+
+## Tests
+
+```
+python -m pytest tests -q
+```
+
+The tests do not call Instagram.
 
 ---
 
 ## Notes
 
-- Downloads go to a `downloads/` folder next to the script by default; use `--output-dir` or the Download tab to change the base folder. The dashboard remembers that folder.
-- Instagram restricts access for non-authenticated requests. Cookies are only needed for age-restricted or private posts; for very large batches you can opt into `--cookies-mode always`.
-- This tool is for personal archival use. Respect Instagram's terms of service and the rights of content creators.
-
----
-
-## Troubleshooting
-
-### "Failed to parse JSON (caused by JSONDecodeError(...))"
-
-**Root cause.** Instagram sometimes answers one of its JSON endpoints with an HTML login / consent / challenge page while still returning HTTP 200. yt-dlp's `InfoExtractor._parse_json()` (in `yt_dlp/extractor/common.py`) then runs `json.loads()` over that HTML and raises:
-
-```
-Failed to parse JSON (caused by JSONDecodeError("Expecting value in '': line 1 column 1 (char 0)"))
-```
-
-It is normally a temporary throttle after a large batch, **not** a broken post.
-
-**What this tool does.** It classifies that message as a transient throttle (`parse_error`) and reuses the same exponential backoff as an explicit rate limit (30s → 60s → 120s → 300s), retrying the URL. After several consecutive failures it pauses, saves progress and aborts, so you can resume later with `--retry-failed`.
-
-**What you should do.**
-
-1. **Update yt-dlp** — Instagram changes its private API constantly and the extractor is fixed often: `pip install -U yt-dlp`.
-2. Wait a while, then re-run. If the content is genuinely login-gated, retry with `--cookies-mode always`.
-
-> Do **not** blindly copy the "fork fix" from issue #2. It does not fix the JSON parse — it simply relabels the error and re-downloads through instaloader. That fork also committed the reporter's `cookies.txt`, saved-post list and `__pycache__`. This repo now ships a `.gitignore` for exactly that reason.
-
----
-
-## Forks and AI-assisted development
-
-**Read this before you (or an AI assistant) commit anything.**
-
-- `.gitignore` is not optional. It keeps `cookies.txt`, `*.session`, `Saved Posts/`, `downloads/`, generated `*.json` logs and `__pycache__/` out of git.
-- A `cookies.txt` is equivalent to your Instagram password. Never commit it, paste it into a chat, attach it to an issue, or share it. If you ever do, revoke the session inside Instagram immediately and rotate the cookie.
-- If you use an AI coding assistant on a fork, tell it explicitly: **do not stage, commit, print or upload any file matching the `.gitignore` patterns, and never echo the contents of `cookies.txt`.**
-- Before opening a pull request, run `git status` and `git diff --staged` and confirm no cookies, URL lists or logs are included.
+- This is for personal archival use. Respect Instagram's terms and the rights of the people who made the posts.
+- Instagram changes often. If a public video stops downloading, update yt-dlp first: `pip install -U yt-dlp`.
+- `.gitignore` keeps `cookies.txt`, URL lists, downloads, and `*.json` logs out of git. Check `git status` before you commit.
 
 ---
 
 ## License
 
-[MIT](LICENSE) © 2026 Don Cezar.
+[MIT](LICENSE). IGbulkDL is © 2026 Don Cezar.
