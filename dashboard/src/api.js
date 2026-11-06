@@ -104,6 +104,17 @@ export async function loadSavedCollections() {
   return data;
 }
 
+export async function setSavedTracking(body) {
+  const response = await fetch("/api/saved/track", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || "Could not update tracking.");
+  return data;
+}
+
 export async function refreshSavedCollections() {
   const response = await fetch("/api/saved/refresh", {
     method: "POST",

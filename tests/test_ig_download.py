@@ -882,6 +882,69 @@ def test_saved_cache_switches_with_the_cookie_account():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_tracking_runs_every_five_days_and_keeps_its_flag():
+    now = ig.datetime(2026, 11, 6, tzinfo=ig.timezone.utc)
+    assert ig.collection_is_due({"tracked": True}, now) is True
+    assert ig.collection_is_due({"tracked": False, "checked_at": ""}, now) is False
+    recent = (now - ig.timedelta(days=4)).isoformat()
+    due = (now - ig.timedelta(days=5)).isoformat()
+    assert ig.collection_is_due({"tracked": True, "checked_at": recent}, now) is False
+    assert ig.collection_is_due({"tracked": True, "checked_at": due}, now) is True
+
+    d = tempfile.mkdtemp(prefix="igdl_track_")
+    cookies = os.path.join(d, "cookies.txt")
+    _netscape_cookie(cookies, "111")
+    haircut = "https://www.instagram.com/jane.doe/saved/haircut/1/"
+    nails = "https://www.instagram.com/jane.doe/saved/nails/2/"
+    ig.set_data_dir(d)
+    try:
+        ig.save_dashboard_settings({
+            "cookies": cookies, "output_dir": d, "filename_template": "{shortcode}",
+        })
+        ig.store_saved_collections("111", "jane.doe", [
+            {"name": "Haircut", "url": haircut, "count": 10},
+            {"name": "Nails", "url": nails, "count": 4},
+        ])
+        one = ig.update_saved_tracking({"url": haircut, "tracked": True})
+        assert one["collections"][0]["tracked"] is True
+        assert one["collections"][1]["tracked"] is False
+        ig.store_saved_collections("111", "jane.doe", [
+            {"name": "Haircut", "url": haircut, "count": 11},
+            {"name": "Nails", "url": nails, "count": 4},
+        ])
+        kept = ig.saved_collections_view()
+        assert kept["collections"][0]["tracked"] is True
+        assert kept["collections"][0]["count"] == 11
+        both = ig.update_saved_tracking({"all": True})
+        assert [item["tracked"] for item in both["collections"]] == [True, True]
+
+        class FakeJob:
+            def __init__(self):
+                self.calls = []
+                self.running = False
+
+            def status(self, since=0):
+                return {"running": self.running}
+
+            def start_saved(self, params):
+                assert params["remember_url_file"] is False
+                self.calls.append(params["url"])
+
+        job = FakeJob()
+        started = ig._run_due_tracks(job, now=now)
+        assert started == [haircut, nails]
+        assert ig._run_due_tracks(job, now=now) == []
+        job.running = True
+        cache = ig.load_saved_cache()
+        cache["accounts"]["111"]["collections"][0]["checked_at"] = due
+        ig.save_saved_cache(cache)
+        assert ig._run_due_tracks(job, now=now) == []
+        assert job.calls == [haircut, nails]
+    finally:
+        ig.set_data_dir(None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_discovered_log_reports_its_parent_as_the_account():
     d = tempfile.mkdtemp(prefix="igdl_disc_")
     nested = os.path.join(d, "jane.doe", "Haircut")

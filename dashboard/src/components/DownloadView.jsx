@@ -4,6 +4,7 @@ import {
   downloadStatus,
   loadSavedCollections,
   refreshSavedCollections,
+  setSavedTracking,
   loadSettings,
   saveSettings,
   startDownload,
@@ -113,6 +114,28 @@ export default function DownloadView({ onLibraryChanged }) {
   }, [form?.cookies]);
 
   useEffect(() => {
+    if (running || !form) return undefined;
+    let cancel = false;
+    const timer = window.setInterval(async () => {
+      try {
+        const status = await downloadStatus(since.current);
+        if (cancel || !status.running) return;
+        setLines([]);
+        setProgress({ index: 0, total: 0, ok: 0, failed: 0 });
+        since.current = 0;
+        finished.current = false;
+        setRunning(true);
+      } catch {
+        /* The next poll tries again. */
+      }
+    }, 8000);
+    return () => {
+      cancel = true;
+      window.clearInterval(timer);
+    };
+  }, [running, form]);
+
+  useEffect(() => {
     if (!running) return undefined;
     let timer = 0;
     let cancelled = false;
@@ -211,6 +234,29 @@ export default function DownloadView({ onLibraryChanged }) {
     remember(next);
   }
 
+  function applySaved(data) {
+    setSaved(data.collections || []);
+    setSavedUser(data.username || "");
+  }
+
+  async function trackSaved(item, tracked) {
+    setSavedMessage("");
+    try {
+      applySaved(await setSavedTracking({ url: item.url, tracked }));
+    } catch (error) {
+      setSavedMessage(error.message);
+    }
+  }
+
+  async function trackAll() {
+    setSavedMessage("");
+    try {
+      applySaved(await setSavedTracking({ all: true }));
+    } catch (error) {
+      setSavedMessage(error.message);
+    }
+  }
+
   async function refreshSaved() {
     setLoadingSaved(true);
     setSavedMessage("");
@@ -278,10 +324,16 @@ export default function DownloadView({ onLibraryChanged }) {
     <section className="download">
       <div className="saved-head">
         <h2>Saved collections{savedUser ? ` · ${savedUser}` : ""}</h2>
-        <button type="button" className="btn btn-secondary" disabled={running || loadingSaved} onClick={refreshSaved}>
-          {loadingSaved ? "Reading page…" : "Refresh"}
-        </button>
+        <div className="saved-actions">
+          <button type="button" className="btn btn-secondary" disabled={running || loadingSaved || saved.length === 0} onClick={trackAll}>
+            Track all
+          </button>
+          <button type="button" className="btn btn-secondary" disabled={running || loadingSaved} onClick={refreshSaved}>
+            {loadingSaved ? "Reading page…" : "Refresh"}
+          </button>
+        </div>
       </div>
+      <p className="saved-count">Tracked collections download new posts every 5 days.</p>
       {savedMessage && <p className="form-error">{savedMessage}</p>}
       {saved.length > 0 && (
         <div className="saved-list">
@@ -291,9 +343,20 @@ export default function DownloadView({ onLibraryChanged }) {
                 <div className="saved-name">{item.name}</div>
                 <CollectionCount item={item} />
               </div>
-              <button type="button" className="btn btn-primary" disabled={running || loadingSaved} onClick={() => downloadSaved(item)}>
-                Download
-              </button>
+              <div className="saved-actions">
+                <label className="track-toggle">
+                  <input
+                    type="checkbox"
+                    checked={!!item.tracked}
+                    disabled={loadingSaved}
+                    onChange={(event) => trackSaved(item, event.target.checked)}
+                  />
+                  Track
+                </label>
+                <button type="button" className="btn btn-primary" disabled={running || loadingSaved} onClick={() => downloadSaved(item)}>
+                  Download
+                </button>
+              </div>
             </div>
           ))}
         </div>

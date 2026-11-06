@@ -36,7 +36,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
@@ -1096,8 +1096,18 @@ def cached_account_username(user_id):
     return name if isinstance(name, str) else ""
 
 
+TRACK_INTERVAL = timedelta(days=5)
+TRACK_POLL_SECONDS = 60 * 60
+TRACK_FIRST_WAIT_SECONDS = 30
+
+
 def store_saved_collections(user_id, username, collections):
     cache = load_saved_cache()
+    previous = {}
+    old_entry = cache["accounts"].get(str(user_id)) or {}
+    for item in old_entry.get("collections") or []:
+        if isinstance(item, dict) and item.get("url"):
+            previous[item["url"]] = item
     stored = []
     for item in collections or []:
         if not isinstance(item, dict):
@@ -1105,6 +1115,10 @@ def store_saved_collections(user_id, username, collections):
         row = {"name": item.get("name") or "", "url": item.get("url") or ""}
         if item.get("count") is not None:
             row["count"] = item.get("count")
+        old = previous.get(row["url"]) or {}
+        row["tracked"] = bool(old.get("tracked"))
+        if old.get("checked_at"):
+            row["checked_at"] = old["checked_at"]
         stored.append(row)
     cache["accounts"][str(user_id)] = {
         "username": username,
@@ -1113,6 +1127,128 @@ def store_saved_collections(user_id, username, collections):
     }
     save_saved_cache(cache)
     return cache["accounts"][str(user_id)]
+
+
+def collection_is_due(item, now=None):
+    """A tracked collection is due when it has never been checked, or the last check was 5 days ago."""
+    if not isinstance(item, dict) or not item.get("tracked"):
+        return False
+    now = now or datetime.now(timezone.utc)
+    raw = item.get("checked_at") or ""
+    if not raw:
+        return True
+    try:
+        then = datetime.fromisoformat(raw)
+    except ValueError:
+        return True
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=timezone.utc)
+    return now - then >= TRACK_INTERVAL
+
+
+def update_saved_tracking(params):
+    """Turn tracking on or off for one saved collection, or for every collection."""
+    if not isinstance(params, dict):
+        raise ValueError("Expected a JSON object.")
+    cookies, _settings = require_cookies_file()
+    user_id = cookie_user_id(cookies)
+    if not user_id:
+        raise ValueError("The cookies file has no account id. Export cookies.txt again.")
+    cache = load_saved_cache()
+    entry = cache["accounts"].get(user_id)
+    if not entry or not entry.get("collections"):
+        raise ValueError("Refresh saved collections before tracking.")
+    if params.get("all"):
+        for item in entry["collections"]:
+            if isinstance(item, dict):
+                item["tracked"] = True
+    else:
+        url = (params.get("url") or "").strip()
+        found = False
+        for item in entry["collections"]:
+            if isinstance(item, dict) and item.get("url") == url:
+                item["tracked"] = bool(params.get("tracked"))
+                found = True
+                break
+        if not found:
+            raise ValueError("That collection is not in the saved list.")
+    save_saved_cache(cache)
+    return saved_collections_view()
+
+
+def mark_collection_checked(user_id, url, when=None):
+    cache = load_saved_cache()
+    entry = cache["accounts"].get(str(user_id)) or {}
+    for item in entry.get("collections") or []:
+        if isinstance(item, dict) and item.get("url") == url:
+            item["checked_at"] = (when or datetime.now(timezone.utc)).isoformat()
+            save_saved_cache(cache)
+            return True
+    return False
+
+
+_track_wake = threading.Event()
+_tracker_started = False
+_tracker_lock = threading.Lock()
+
+
+def wake_collection_tracker():
+    _track_wake.set()
+
+
+def _run_due_tracks(job, now=None):
+    """Download each tracked collection that is due. One collection at a time."""
+    try:
+        cookies, _settings = require_cookies_file()
+    except ValueError:
+        return []
+    user_id = cookie_user_id(cookies)
+    if not user_id:
+        return []
+    now = now or datetime.now(timezone.utc)
+    entry = load_saved_cache()["accounts"].get(user_id) or {}
+    started = []
+    for item in entry.get("collections") or []:
+        if not collection_is_due(item, now):
+            continue
+        if job.status().get("running"):
+            break
+        url = item.get("url") or ""
+        try:
+            job.start_saved({
+                "name": item.get("name") or "",
+                "url": url,
+                "retry_failed": True,
+                "remember_url_file": False,
+            })
+        except (DownloadBusy, ValueError):
+            break
+        while job.status().get("running"):
+            time.sleep(1)
+        mark_collection_checked(user_id, url)
+        started.append(url)
+    return started
+
+
+def _track_loop(job):
+    if _track_wake.wait(TRACK_FIRST_WAIT_SECONDS):
+        _track_wake.clear()
+    while True:
+        try:
+            _run_due_tracks(job)
+        except Exception:
+            pass
+        _track_wake.wait(TRACK_POLL_SECONDS)
+        _track_wake.clear()
+
+
+def start_collection_tracker(job):
+    global _tracker_started
+    with _tracker_lock:
+        if _tracker_started:
+            return
+        _tracker_started = True
+    threading.Thread(target=_track_loop, args=(job,), name="ig-track", daemon=True).start()
 
 
 def require_cookies_file():
@@ -1647,7 +1783,8 @@ class DownloadJob:
                 url_file = write_collection_url_file(
                     prepared["collection"], urls, directory=prepared["output_dir"]
                 )
-                save_dashboard_settings({"url_file": url_file})
+                if params.get("remember_url_file", True):
+                    save_dashboard_settings({"url_file": url_file})
                 self._append({
                     "type": "collecting",
                     "found": len(urls),
@@ -1751,6 +1888,15 @@ class _DashboardHandler(SimpleHTTPRequestHandler):
                 self._send_json(refresh_saved_collections())
             except ValueError as exc:
                 self._send_error_json(400, str(exc))
+            return
+        if parsed.path == "/api/saved/track":
+            try:
+                payload = update_saved_tracking(data)
+            except ValueError as exc:
+                self._send_error_json(400, str(exc))
+                return
+            wake_collection_tracker()
+            self._send_json(payload)
             return
         if parsed.path == "/api/saved/download":
             try:
@@ -1984,6 +2130,7 @@ def ensure_dashboard_server(extra_roots=None, port=8765, host=None):
             httpd.ui_root = dashboard_ui_root(script_dir)
             httpd.library_roots = roots
             httpd.job = DownloadJob()
+            start_collection_tracker(httpd.job)
             thread = threading.Thread(target=httpd.serve_forever, name="ig-dashboard", daemon=True)
             thread.start()
             _dashboard_server = httpd
