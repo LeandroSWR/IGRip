@@ -1072,7 +1072,10 @@ def _open_instagram(cookies_file):
         ) from exc
     pw = sync_playwright().start()
     try:
-        browser = pw.chromium.launch(headless=True)
+        browser = pw.chromium.launch(
+            headless=True,
+            args=["--disable-dev-shm-usage", "--no-sandbox"],
+        )
     except Exception as exc:
         pw.stop()
         raise ValueError(
