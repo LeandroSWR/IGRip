@@ -135,6 +135,38 @@ python ig_download.py --dashboard
 
 There is no login on the page. Do not publish that port past your home network. Anyone who can open it can see the library and start a download with the cookies file.
 
+### TrueNAS Scale custom app
+
+TrueNAS installs a container image. It does not build this repository. Pushing `main` or `nas-automation` publishes `ghcr.io/leandroswr/igrip:latest`. The first package GitHub creates is private: open the package settings and make it public, or the NAS pull fails.
+
+In **Install Custom App**, leave Version as TrueNAS shows it. Use these values:
+
+| Field | Value |
+|---|---|
+| Application name | `igrip` |
+| Image repository | `ghcr.io/leandroswr/igrip` |
+| Tag | `latest` |
+| Pull policy | Always, so an update pulls the new image |
+| Timezone | `Europe/Lisbon` (or yours) |
+| Restart policy | Unless stopped |
+| Host network | off |
+| Command | empty. The image already starts the dashboard |
+
+Environment variables:
+
+| Name | Value |
+|---|---|
+| `IGRIP_HOST` | `0.0.0.0` |
+| `IGRIP_DATA` | `/data` |
+
+Port: container `8765`, host `8765`, TCP.
+
+Portal: name `IG RIP`, protocol HTTP, port `8765`. That adds the web button in the TrueNAS apps list.
+
+Storage: one host path. Mount your dataset at `/data`. Put `cookies.txt` in that dataset. In the Download tab, set the cookies file to `/data/cookies.txt` and the output folder to `/data` (or a folder inside it). The library, settings, and downloads stay on the dataset when you update the image.
+
+Leave Privileged and Custom User off. Chromium is started with the flags a container needs. Do not forward host port 8765 from your router.
+
 ---
 
 ## Tests
