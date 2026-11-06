@@ -523,6 +523,7 @@ def discover_collections(roots):
             hrefs = [_log_href(path, web_root) for path in logs]
             found[key] = {
                 "name": os.path.basename(dirpath),
+                "account": _library_account(dirpath, roots),
                 "dir": os.path.relpath(dirpath, web_root).replace("\\", "/")
                 if path_is_under(dirpath, [web_root])
                 else os.path.abspath(dirpath),
@@ -531,6 +532,17 @@ def discover_collections(roots):
             }
             dirnames.clear()
     return sorted(found.values(), key=lambda c: c["name"].lower())
+
+
+def _library_account(dirpath, roots):
+    """The account folder is the parent of a collection, one level under a library root."""
+    parent = os.path.dirname(os.path.abspath(dirpath))
+    known = {os.path.realpath(root) for root in roots if root}
+    if os.path.realpath(parent) in known:
+        return ""
+    if os.path.realpath(os.path.dirname(parent)) in known:
+        return os.path.basename(parent)
+    return ""
 
 
 def _log_href(path, web_root):
@@ -964,10 +976,14 @@ def collection_folder_name(name):
     return validate_collection(cleaned)
 
 
-def _downloaded_counts(roots):
+def _downloaded_counts(roots, account=None):
     """How many posts each collection folder already has, by folder name."""
     counts = {}
+    wanted = None if account is None else (account or "").casefold()
     for collection in discover_collections(roots):
+        found_account = (collection.get("account") or "").casefold()
+        if wanted is not None and found_account != wanted:
+            continue
         seen = set()
         saved = failed = 0
         for path in collection.get("abs_logs") or []:
@@ -993,9 +1009,9 @@ def _downloaded_counts(roots):
     return counts
 
 
-def annotate_collection_counts(collections, roots):
+def annotate_collection_counts(collections, roots, account=None):
     """Add how many posts we already have next to Instagram's count."""
-    counts = _downloaded_counts(roots)
+    counts = _downloaded_counts(roots, account=account)
     for item in collections or []:
         try:
             folder = collection_folder_name(item.get("name") or "")
@@ -1008,11 +1024,95 @@ def annotate_collection_counts(collections, roots):
 
 
 def is_saved_collection_url(url):
+    return bool(_saved_url_parts(url))
+
+
+def _saved_url_parts(url):
     parsed = urllib.parse.urlparse((url or "").strip())
     if parsed.scheme != "https" or parsed.netloc.lower() not in ("www.instagram.com", "instagram.com"):
-        return False
+        return []
     parts = [part for part in parsed.path.split("/") if part]
-    return len(parts) >= 3 and parts[1].lower() == "saved"
+    if len(parts) < 3 or parts[1].lower() != "saved":
+        return []
+    return parts
+
+
+def account_from_saved_url(url):
+    """The username is the first part of /{username}/saved/{collection}/."""
+    parts = _saved_url_parts(url)
+    return parts[0] if parts else ""
+
+
+def account_output_dir(output_base, username):
+    """output/<username>, still inside the chosen output folder."""
+    return resolve_output_dir(output_base, collection_folder_name(username))
+
+
+def cookie_user_id(cookies_file):
+    """Instagram's numeric account id from a Netscape cookies file."""
+    if not cookies_file or not os.path.isfile(cookies_file):
+        return ""
+    try:
+        import http.cookiejar
+        jar = http.cookiejar.MozillaCookieJar(cookies_file)
+        jar.load(ignore_discard=True, ignore_expires=True)
+    except OSError:
+        return ""
+    for cookie in jar:
+        if cookie.name == "ds_user_id" and cookie.value:
+            return str(cookie.value)
+    return ""
+
+
+def _saved_cache_path():
+    return os.path.join(_state_dir(), "saved_collections.json")
+
+
+def load_saved_cache():
+    try:
+        with open(_saved_cache_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {"accounts": {}}
+    if not isinstance(data, dict) or not isinstance(data.get("accounts"), dict):
+        return {"accounts": {}}
+    return data
+
+
+def save_saved_cache(data):
+    path = _saved_cache_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+    os.replace(tmp, path)
+
+
+def cached_account_username(user_id):
+    if not user_id:
+        return ""
+    entry = load_saved_cache()["accounts"].get(str(user_id)) or {}
+    name = entry.get("username") or ""
+    return name if isinstance(name, str) else ""
+
+
+def store_saved_collections(user_id, username, collections):
+    cache = load_saved_cache()
+    stored = []
+    for item in collections or []:
+        if not isinstance(item, dict):
+            continue
+        row = {"name": item.get("name") or "", "url": item.get("url") or ""}
+        if item.get("count") is not None:
+            row["count"] = item.get("count")
+        stored.append(row)
+    cache["accounts"][str(user_id)] = {
+        "username": username,
+        "updated": datetime.now(timezone.utc).isoformat(),
+        "collections": stored,
+    }
+    save_saved_cache(cache)
+    return cache["accounts"][str(user_id)]
 
 
 def require_cookies_file():
@@ -1222,7 +1322,13 @@ def _gather_post_urls(page, max_steps=80, on_count=None, stop_event=None):
     return urls
 
 
-def list_saved_collections():
+def _count_collection_posts(page, max_steps=80):
+    """How many posts are in the collection that is already open."""
+    count = len(_gather_post_urls(page, max_steps=max_steps))
+    return count or None
+
+
+def list_saved_collections(count_posts=False):
     """Open the saved page and return the collection names and links on it."""
     cookies, _settings = require_cookies_file()
     with _BROWSER_LOCK:
@@ -1250,9 +1356,71 @@ def list_saved_collections():
             collections = _scroll_collect(
                 page, lambda page_html: parse_saved_collections(page_html, username)
             )
+            if count_posts:
+                for item in collections:
+                    try:
+                        page.goto(item["url"], wait_until="domcontentloaded", timeout=45000)
+                        page.wait_for_timeout(1200)
+                        counted = _count_collection_posts(page)
+                    except SavedPageError:
+                        raise ValueError(_LOGIN_AGAIN) from None
+                    except Exception:
+                        counted = None
+                    if counted is not None:
+                        item["count"] = counted
             return {"username": username, "collections": collections}
         finally:
             _close_instagram(pw, browser)
+
+
+def _attach_local_counts(collections, username, output_dir):
+    """The downloaded number comes from that account's folders, not the cached total."""
+    if output_dir and os.path.isdir(output_dir):
+        annotate_collection_counts(collections, [output_dir], account=username or "")
+    else:
+        for item in collections or []:
+            item["saved"] = 0
+            item["failed"] = 0
+    return collections
+
+
+def saved_collections_view():
+    """The cached list for the cookies file that is selected now. No browser."""
+    try:
+        cookies, settings = require_cookies_file()
+    except ValueError:
+        return {"username": "", "user_id": "", "collections": []}
+    user_id = cookie_user_id(cookies)
+    entry = load_saved_cache()["accounts"].get(user_id) or {}
+    username = entry.get("username") or ""
+    collections = []
+    for item in entry.get("collections") or []:
+        if isinstance(item, dict):
+            collections.append(dict(item))
+    output_dir = _resolve_user_path(settings.get("output_dir") or "downloads")
+    _attach_local_counts(collections, username, output_dir)
+    return {
+        "username": username,
+        "user_id": user_id,
+        "updated": entry.get("updated") or "",
+        "collections": collections,
+    }
+
+
+def refresh_saved_collections():
+    """Open Instagram, recount every collection, and replace this account's cache."""
+    cookies, settings = require_cookies_file()
+    user_id = cookie_user_id(cookies)
+    if not user_id:
+        raise ValueError("The cookies file has no account id. Export cookies.txt again.")
+    payload = list_saved_collections(count_posts=True)
+    username = payload.get("username") or ""
+    store_saved_collections(user_id, username, payload.get("collections"))
+    output_dir = _resolve_user_path(settings.get("output_dir") or "downloads")
+    _attach_local_counts(payload.get("collections"), username, output_dir)
+    payload["user_id"] = user_id
+    payload["updated"] = load_saved_cache()["accounts"].get(user_id, {}).get("updated") or ""
+    return payload
 
 
 def collect_collection_posts(cookies_file, collection_url, stop_event=None, progress_cb=None):
@@ -1278,10 +1446,11 @@ def collect_collection_posts(cookies_file, collection_url, stop_event=None, prog
             _close_instagram(pw, browser)
 
 
-def write_collection_url_file(name, urls):
-    """Store the collected links beside the project. Collections/ is gitignored."""
+def write_collection_url_file(name, urls, directory=None):
+    """Store the collected links. Saved runs keep the file in that account's folder."""
     folder = collection_folder_name(name)
-    directory = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Collections")
+    if not directory:
+        directory = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Collections")
     os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, f"{folder}.txt")
     with open(path, "w", encoding="utf-8") as fh:
@@ -1301,6 +1470,10 @@ def prepare_saved_download(params):
         raise ValueError("That is not a saved collection link.")
     output_full = _resolve_user_path(settings.get("output_dir") or "downloads")
     _require_storage_dir(output_full, "Output folder")
+    account = account_from_saved_url(url)
+    if account:
+        output_full = account_output_dir(output_full, account)
+        _require_storage_dir(output_full, "Output folder")
     template = validate_filename_template(settings.get("filename_template") or "{shortcode}")
     retry = params.get("retry_failed", True)
     return {
@@ -1345,6 +1518,7 @@ def prepare_download_request(params):
         cookies = inside_storage(cookies, "Cookies file", True)
     output_full = _resolve_user_path(output_dir)
     _require_storage_dir(output_full, "Output folder")
+    account = cached_account_username(cookie_user_id(cookies)) if cookies else ""
 
     save_dashboard_settings({
         "url_file": url_full,
@@ -1353,6 +1527,9 @@ def prepare_download_request(params):
         "cookies_mode": mode,
         "filename_template": template,
     })
+    if account:
+        output_full = account_output_dir(output_full, account)
+        _require_storage_dir(output_full, "Output folder")
     return {
         "url_file": url_full,
         "collection": collection,
@@ -1454,16 +1631,22 @@ class DownloadJob:
                     )
                 except SavedPageError as exc:
                     if exc.urls:
-                        write_collection_url_file(prepared["collection"], exc.urls)
+                        write_collection_url_file(
+                            prepared["collection"], exc.urls, directory=prepared["output_dir"]
+                        )
                     raise
                 if stop.is_set():
                     if urls:
-                        write_collection_url_file(prepared["collection"], urls)
+                        write_collection_url_file(
+                            prepared["collection"], urls, directory=prepared["output_dir"]
+                        )
                     self._append({"type": "stopped"})
                     return
                 if not urls:
                     raise ValueError("No posts found in that collection.")
-                url_file = write_collection_url_file(prepared["collection"], urls)
+                url_file = write_collection_url_file(
+                    prepared["collection"], urls, directory=prepared["output_dir"]
+                )
                 save_dashboard_settings({"url_file": url_file})
                 self._append({
                     "type": "collecting",
@@ -1519,13 +1702,8 @@ class _DashboardHandler(SimpleHTTPRequestHandler):
             self._send_json(self._job().status(since))
             return
         if parsed.path == "/api/saved/collections":
-            if self._job().status()["running"]:
-                self._send_error_json(409, "A download is already running.")
-                return
             try:
-                payload = list_saved_collections()
-                annotate_collection_counts(payload.get("collections"), library_roots())
-                self._send_json(payload)
+                self._send_json(saved_collections_view())
             except ValueError as exc:
                 self._send_error_json(400, str(exc))
             return
@@ -1562,6 +1740,15 @@ class _DashboardHandler(SimpleHTTPRequestHandler):
                 self._send_json(self._job().start(data))
             except DownloadBusy as exc:
                 self._send_error_json(409, str(exc))
+            except ValueError as exc:
+                self._send_error_json(400, str(exc))
+            return
+        if parsed.path == "/api/saved/refresh":
+            if self._job().status()["running"]:
+                self._send_error_json(409, "A download is already running.")
+                return
+            try:
+                self._send_json(refresh_saved_collections())
             except ValueError as exc:
                 self._send_error_json(400, str(exc))
             return

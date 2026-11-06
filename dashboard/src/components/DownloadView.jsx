@@ -3,6 +3,7 @@ import {
   browseFolder,
   downloadStatus,
   loadSavedCollections,
+  refreshSavedCollections,
   loadSettings,
   saveSettings,
   startDownload,
@@ -60,9 +61,10 @@ function lineFor(event) {
 function CollectionCount({ item }) {
   const have = item.saved ?? 0;
   const failed = item.failed ?? 0;
+  const total = Number.isFinite(item.count) ? item.count : null;
   return (
     <div className="saved-count">
-      {have} downloaded
+      {total != null ? `${have}/${total} downloaded` : `${have} downloaded`}
       {failed > 0 && <span className="saved-failed"> · {failed} failed</span>}
     </div>
   );
@@ -78,6 +80,7 @@ export default function DownloadView({ onLibraryChanged }) {
   const [lines, setLines] = useState([]);
   const [progress, setProgress] = useState({ index: 0, total: 0, ok: 0, failed: 0 });
   const [saved, setSaved] = useState([]);
+  const [savedUser, setSavedUser] = useState("");
   const [savedMessage, setSavedMessage] = useState("");
   const [loadingSaved, setLoadingSaved] = useState(false);
   const [picker, setPicker] = useState(null);
@@ -91,6 +94,23 @@ export default function DownloadView({ onLibraryChanged }) {
       .then(setForm)
       .catch((error) => setMessage(error.message));
   }, []);
+
+  useEffect(() => {
+    if (!form) return undefined;
+    let cancel = false;
+    loadSavedCollections()
+      .then((data) => {
+        if (cancel) return;
+        setSaved(data.collections || []);
+        setSavedUser(data.username || "");
+      })
+      .catch((error) => {
+        if (!cancel) setSavedMessage(error.message);
+      });
+    return () => {
+      cancel = true;
+    };
+  }, [form?.cookies]);
 
   useEffect(() => {
     if (!running) return undefined;
@@ -122,6 +142,11 @@ export default function DownloadView({ onLibraryChanged }) {
         if (!status.running && finished.current) {
           finished.current = false;
           onLibraryChanged();
+          const fresh = await loadSavedCollections();
+          if (!cancelled) {
+            setSaved(fresh.collections || []);
+            setSavedUser(fresh.username || "");
+          }
         }
       } catch (error) {
         if (!cancelled) setMessage(error.message);
@@ -190,11 +215,11 @@ export default function DownloadView({ onLibraryChanged }) {
     setLoadingSaved(true);
     setSavedMessage("");
     try {
-      const data = await loadSavedCollections();
+      const data = await refreshSavedCollections();
       setSaved(data.collections || []);
+      setSavedUser(data.username || "");
       setSavedMessage(data.collections?.length ? "" : "No saved collections on that page.");
     } catch (error) {
-      setSaved([]);
       setSavedMessage(error.message);
     } finally {
       setLoadingSaved(false);
@@ -252,7 +277,7 @@ export default function DownloadView({ onLibraryChanged }) {
   return (
     <section className="download">
       <div className="saved-head">
-        <h2>Saved collections</h2>
+        <h2>Saved collections{savedUser ? ` · ${savedUser}` : ""}</h2>
         <button type="button" className="btn btn-secondary" disabled={running || loadingSaved} onClick={refreshSaved}>
           {loadingSaved ? "Reading page…" : "Refresh"}
         </button>

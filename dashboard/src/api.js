@@ -18,7 +18,11 @@ export async function loadLibrary() {
         continue;
       }
       for (const item of log.items || []) {
-        items.push({ ...item, collection: item.collection || collection.name });
+        items.push({
+          ...item,
+          collection: item.collection || collection.name,
+          account: item.account || collection.account || "",
+        });
       }
     }
   }
@@ -28,7 +32,7 @@ export async function loadLibrary() {
 export function dedupeItems(items) {
   const byKey = new Map();
   for (const item of items) {
-    const key = `${item.collection || ""}\u001f${item.url || ""}`;
+    const key = `${item.account || ""}\u001f${item.collection || ""}\u001f${item.url || ""}`;
     byKey.set(key, { ...item, key });
   }
   return [...byKey.values()];
@@ -97,6 +101,17 @@ export async function loadSavedCollections() {
   const response = await fetch("/api/saved/collections", { cache: "no-store" });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error || "Could not read saved collections.");
+  return data;
+}
+
+export async function refreshSavedCollections() {
+  const response = await fetch("/api/saved/refresh", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || "Could not refresh saved collections.");
   return data;
 }
 

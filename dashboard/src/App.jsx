@@ -9,6 +9,7 @@ import TopBar from "./components/TopBar.jsx";
 export default function App() {
   const [items, setItems] = useState([]);
   const [view, setView] = useState("instagram");
+  const [account, setAccount] = useState("");
   const [collection, setCollection] = useState("");
   const [openItem, setOpenItem] = useState(null);
   const [message, setMessage] = useState("Loading collections…");
@@ -37,7 +38,9 @@ export default function App() {
     }
   }
 
-  const collectionCount = new Set(items.map((item) => item.collection).filter(Boolean)).size;
+  const collectionCount = new Set(
+    items.filter((item) => item.collection).map((item) => `${item.account || ""}\u0000${item.collection}`),
+  ).size;
 
   return (
     <>
@@ -51,13 +54,20 @@ export default function App() {
         ) : view === "instagram" ? (
           <InstagramView
             items={items}
+            account={account}
+            onAccount={setAccount}
             collection={collection}
             onCollection={setCollection}
             onOpen={setOpenItem}
           />
         ) : (
           <LogView
-            items={collection ? items.filter((item) => item.collection === collection) : items}
+            items={items.filter((item) => {
+              if (account && item.account !== account) return false;
+              if (!collection) return true;
+              const [selectedAccount, selectedName] = collection.split("\u0000");
+              return (item.account || "") === selectedAccount && (item.collection || "Collection") === selectedName;
+            })}
             onOpen={setOpenItem}
           />
         )}
