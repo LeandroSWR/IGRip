@@ -31,7 +31,7 @@ export default function LogView({ items, onOpen }) {
       if (!query) return true;
       const haystack = [
         item.shortcode, item.author, item.username, item.title, item.caption,
-        item.error_detail, item.error_category, item.saved_path, item.collection,
+        item.error_detail, item.error_category, item.saved_path, item.collection, item.account,
       ].join(" ").toLowerCase();
       return haystack.includes(query);
     });
@@ -91,6 +91,9 @@ export default function LogView({ items, onOpen }) {
                 <td>{(safePage - 1) * PAGE_SIZE + index + 1}</td>
                 <td>
                   <div>{item.author || item.username || "—"}</div>
+                  {item.account && (
+                    <div className="caption">{item.collection ? `${item.account} / ${item.collection}` : item.account}</div>
+                  )}
                   {item.caption && <div className="caption">{item.caption}</div>}
                 </td>
                 <td className="mono">{item.shortcode || "—"}</td>

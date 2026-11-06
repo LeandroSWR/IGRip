@@ -660,9 +660,10 @@ def test_saved_job_writes_urls_then_downloads():
             progress_cb({"type": "collecting", "found": 1, "message": "Reading the collection… 1 posts"})
         return ["https://www.instagram.com/p/AbCdEfGhIj/"]
 
-    def fake_write(name, urls):
+    def fake_write(name, urls, directory=None):
         seen["name"] = name
         seen["urls"] = urls
+        seen["directory"] = directory
         return url_file
 
     def fake_run(**kwargs):
@@ -788,6 +789,112 @@ def test_save_carousel_images_writes_photo_slides_only():
         assert [os.path.basename(path) for path in saved] == ["02.jpg"]
         assert opened.call_args.args[0].full_url == "https://cdn.example/large.jpg"
         assert os.path.getsize(os.path.join(d, "02.jpg")) > 0
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _netscape_cookie(path, user_id):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("# Netscape HTTP Cookie File\n")
+        fh.write(f".instagram.com\tTRUE\t/\tTRUE\t0\tds_user_id\t{user_id}\n")
+
+
+def test_saved_download_uses_the_account_folder():
+    d = tempfile.mkdtemp(prefix="igdl_acct_")
+    cookies = os.path.join(d, "cookies.txt")
+    _netscape_cookie(cookies, "111")
+    try:
+        with mock.patch.object(ig, "browse_home", return_value=os.path.realpath(d)), \
+             mock.patch.object(ig, "load_dashboard_settings", return_value={
+                 "cookies": cookies, "output_dir": d, "filename_template": "{shortcode}",
+             }):
+            prepared = ig.prepare_saved_download({
+                "name": "Haircut",
+                "url": "https://www.instagram.com/jane.doe/saved/haircut/1/",
+            })
+        assert os.path.basename(prepared["output_dir"]) == "jane.doe"
+        assert os.path.dirname(os.path.realpath(prepared["output_dir"])) == os.path.realpath(d)
+        path = ig.write_collection_url_file(
+            "Haircut", ["https://www.instagram.com/p/AbCdEfGhIj/"], directory=prepared["output_dir"]
+        )
+        assert os.path.basename(os.path.dirname(path)) == "jane.doe"
+        assert os.path.basename(path) == "Haircut.txt"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_saved_cache_switches_with_the_cookie_account():
+    d = tempfile.mkdtemp(prefix="igdl_cache_")
+    one = os.path.join(d, "one.txt")
+    two = os.path.join(d, "two.txt")
+    _netscape_cookie(one, "111")
+    _netscape_cookie(two, "222")
+    folder = os.path.join(d, "jane.doe", "Haircut")
+    os.makedirs(folder)
+    with open(os.path.join(folder, "Haircut.json"), "w", encoding="utf-8") as fh:
+        json.dump({"items": [{"url": "https://www.instagram.com/p/aaa/", "status": "ok"}]}, fh)
+    loose = os.path.join(d, "Haircut")
+    os.makedirs(loose)
+    with open(os.path.join(loose, "Haircut.json"), "w", encoding="utf-8") as fh:
+        json.dump({"items": [
+            {"url": "https://www.instagram.com/p/bbb/", "status": "ok"},
+            {"url": "https://www.instagram.com/p/ccc/", "status": "ok"},
+        ]}, fh)
+    ig.set_data_dir(d)
+    try:
+        ig.store_saved_collections("111", "jane.doe", [{
+            "name": "Haircut",
+            "url": "https://www.instagram.com/jane.doe/saved/haircut/1/",
+            "count": 10,
+        }])
+        ig.store_saved_collections("222", "other.user", [{
+            "name": "Nails",
+            "url": "https://www.instagram.com/other.user/saved/nails/2/",
+            "count": 4,
+        }])
+        settings = {"output_dir": d, "filename_template": "{shortcode}"}
+        with mock.patch.object(ig, "load_dashboard_settings", return_value={**settings, "cookies": one}):
+            first = ig.saved_collections_view()
+        with mock.patch.object(ig, "load_dashboard_settings", return_value={**settings, "cookies": two}):
+            second = ig.saved_collections_view()
+        assert first["username"] == "jane.doe"
+        assert first["collections"][0]["count"] == 10
+        assert first["collections"][0]["saved"] == 1
+        assert second["username"] == "other.user"
+        assert second["collections"][0]["name"] == "Nails"
+        assert second["collections"][0]["saved"] == 0
+        urlf = os.path.join(d, "urls.txt")
+        with open(urlf, "w", encoding="utf-8") as fh:
+            fh.write("https://www.instagram.com/p/AAA/\n")
+        with mock.patch.object(ig, "save_dashboard_settings", side_effect=lambda data: data):
+            nested = ig.prepare_download_request({
+                "url_file": urlf, "collection": "Haircut", "output_dir": d,
+                "cookies": one, "cookies_mode": "fallback",
+            })
+            plain = ig.prepare_download_request({
+                "url_file": urlf, "collection": "Haircut", "output_dir": d,
+                "cookies": "", "cookies_mode": "fallback",
+            })
+        assert os.path.basename(nested["output_dir"]) == "jane.doe"
+        assert os.path.realpath(plain["output_dir"]) == os.path.realpath(d)
+    finally:
+        ig.set_data_dir(None)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_discovered_log_reports_its_parent_as_the_account():
+    d = tempfile.mkdtemp(prefix="igdl_disc_")
+    nested = os.path.join(d, "jane.doe", "Haircut")
+    loose = os.path.join(d, "Loose")
+    os.makedirs(nested)
+    os.makedirs(loose)
+    for folder, name in ((nested, "Haircut"), (loose, "Loose")):
+        with open(os.path.join(folder, f"{name}.json"), "w", encoding="utf-8") as fh:
+            json.dump({"items": []}, fh)
+    try:
+        found = {item["name"]: item.get("account") for item in ig.discover_collections([d])}
+        assert found["Haircut"] == "jane.doe"
+        assert found["Loose"] == ""
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
