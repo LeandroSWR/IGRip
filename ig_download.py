@@ -1225,6 +1225,8 @@ def _run_due_tracks(job, now=None):
             break
         while job.status().get("running"):
             time.sleep(1)
+        if any(event.get("type") == "error" for event in job.status().get("events") or []):
+            break
         mark_collection_checked(user_id, url)
         started.append(url)
     return started
@@ -1399,29 +1401,67 @@ _VISIBLE_POSTS_JS = r"""
     seen.add(match[2]);
     found.push([match[1], match[2]]);
   }
-  let best = document.scrollingElement || document.body;
-  let room = 0;
-  const nodes = [document.scrollingElement, document.body, ...document.querySelectorAll('div')];
-  for (const node of nodes) {
-    if (!node) continue;
-    const extra = node.scrollHeight - node.clientHeight;
-    if (extra > room) {
-      room = extra;
-      best = node;
+  for (const el of document.querySelectorAll('button, [role="button"]')) {
+    const text = (el.textContent || '').trim().toLowerCase();
+    if (text === 'retry' || text === 'try again') {
+      return { posts: found, moved: false, retry: true };
     }
   }
-  best.scrollTop = (best.scrollTop || 0) + Math.max((best.clientHeight || 700) * 0.85, 600);
-  window.scrollTo(0, document.body.scrollHeight);
-  return found;
+  const link = document.querySelector('a[href*="/p/"], a[href*="/reel/"]');
+  const step = Math.max((window.innerHeight || 800) * 0.72, 480);
+  const chain = [];
+  let node = link ? link.parentElement : null;
+  while (node) {
+    chain.push(node);
+    node = node.parentElement;
+  }
+  chain.push(document.scrollingElement, document.documentElement, document.body);
+  const tried = new Set();
+  let moved = false;
+  for (const target of chain) {
+    if (!target || tried.has(target)) continue;
+    tried.add(target);
+    const before = target.scrollTop || 0;
+    const extra = (target.scrollHeight || 0) - (target.clientHeight || 0);
+    const isRoot = target === document.scrollingElement || target === document.documentElement;
+    if (extra <= 8 && !isRoot) continue;
+    target.scrollTop = before + step;
+    if ((target.scrollTop || 0) > before + 2) {
+      moved = true;
+      break;
+    }
+  }
+  if (!moved) window.scrollBy(0, step);
+  return { posts: found, moved: moved || window.scrollY > 0 };
 }
 """
 
 
-def _gather_post_urls(page, max_steps=80, on_count=None, stop_event=None):
+def _wheel_feed(page):
+    """A real wheel event, for when Instagram ignores a scripted scrollTop."""
+    mouse = getattr(page, "mouse", None)
+    if mouse is None:
+        return
+    try:
+        mouse.move(640, 560)
+        mouse.wheel(0, 1100)
+    except Exception:
+        return
+
+
+def _pairs_from_collect(raw):
+    if isinstance(raw, dict):
+        return raw.get("posts") or [], bool(raw.get("moved")), bool(raw.get("retry"))
+    return raw or [], True, False
+
+
+def _gather_post_urls(page, max_steps=80, on_count=None, stop_event=None, progress_cb=None):
     """Collect post links while scrolling.
 
     Instagram removes links that scroll off screen, so each pass is merged
     into the posts already seen. The count therefore only stays or grows.
+    The first screen is 12 posts. Scrolling has to move the list that holds
+    those links, or the page never loads the rest.
     """
     if looks_like_login(page.url, ""):
         raise SavedPageError(_LOGIN_AGAIN)
@@ -1429,12 +1469,29 @@ def _gather_post_urls(page, max_steps=80, on_count=None, stop_event=None):
     urls = []
     last = None
     idle = 0
+    rate_waits = 0
     for step in range(max_steps):
         if stop_event is not None and stop_event.is_set():
             break
         if looks_like_login(page.url, ""):
             raise SavedPageError(_LOGIN_AGAIN, urls)
-        for pair in page.evaluate(_VISIBLE_POSTS_JS) or []:
+        pairs, moved, retry = _pairs_from_collect(page.evaluate(_VISIBLE_POSTS_JS))
+        if retry:
+            idle = 0
+            rate_waits += 1
+            if rate_waits > 2:
+                raise ValueError(
+                    f"Instagram is rate limiting this collection. It loaded {len(urls)} posts "
+                    "and then stopped. Wait a bit and try the download again."
+                )
+            if not _wait_rate_limit(rate_waits, stop_event=stop_event, progress_cb=progress_cb):
+                break
+            _click_retry(page)
+            page.wait_for_timeout(1500)
+            continue
+        if not moved:
+            _wheel_feed(page)
+        for pair in pairs:
             if not isinstance(pair, (list, tuple)) or len(pair) != 2:
                 continue
             kind, code = pair
@@ -1447,12 +1504,12 @@ def _gather_post_urls(page, max_steps=80, on_count=None, stop_event=None):
             on_count(count)
         if count == last:
             idle += 1
-            if idle >= 3 and (count > 0 or step >= 6):
+            if idle >= 4 and (count > 0 or step >= 6):
                 break
         else:
             idle = 0
             last = count
-        page.wait_for_timeout(400)
+        page.wait_for_timeout(700)
     if looks_like_login(page.url, ""):
         raise SavedPageError(_LOGIN_AGAIN, urls)
     return urls
@@ -1500,6 +1557,10 @@ def list_saved_collections(count_posts=False):
                         counted = _count_collection_posts(page)
                     except SavedPageError:
                         raise ValueError(_LOGIN_AGAIN) from None
+                    except ValueError as exc:
+                        if "rate limit" in str(exc).lower():
+                            break
+                        counted = None
                     except Exception:
                         counted = None
                     if counted is not None:
@@ -1577,7 +1638,9 @@ def collect_collection_posts(cookies_file, collection_url, stop_event=None, prog
                         "message": f"Reading the collection… {count} posts",
                     })
 
-            return _gather_post_urls(page, on_count=on_count, stop_event=stop_event)
+            return _gather_post_urls(
+                page, on_count=on_count, stop_event=stop_event, progress_cb=progress_cb
+            )
         finally:
             _close_instagram(pw, browser)
 

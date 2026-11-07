@@ -588,6 +588,34 @@ def test_gather_post_urls_keeps_posts_that_scroll_away():
     assert seen == [2, 3]
 
 
+def test_gather_waits_instead_of_stopping_at_the_first_screen():
+    class Page:
+        def __init__(self):
+            self.url = "https://www.instagram.com/jane.doe/saved/haircut/1/"
+
+        def evaluate(self, script):
+            return {"posts": [["p", "aaaaa"]], "moved": False, "retry": True}
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+    waits = []
+
+    def fake_wait(consecutive, stop_event=None, progress_cb=None):
+        waits.append(consecutive)
+        return True
+
+    with mock.patch.object(ig, "_wait_rate_limit", side_effect=fake_wait), \
+         mock.patch.object(ig, "_click_retry", return_value=True):
+        try:
+            ig._gather_post_urls(Page())
+        except ValueError as exc:
+            assert "rate limit" in str(exc).lower()
+        else:
+            raise AssertionError("a rate limit must not be saved as the whole collection")
+    assert waits == [1, 2]
+
+
 def test_saved_collection_counts_compare_with_the_library():
     d = tempfile.mkdtemp(prefix="igdl_counts_")
     folder = os.path.join(d, "Haircut")
