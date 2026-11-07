@@ -68,7 +68,7 @@ Export a Netscape `cookies.txt` while logged into instagram.com. The extension [
 | `always` | Send cookies on every request. |
 | `never` | Ignore the cookies file. |
 
-A saved-collection download always sends cookies, because that page is only visible while logged in.
+Reading a saved collection uses the cookies file, because that page is only visible while logged in. Downloading the posts uses fallback: cookies are sent only when a post needs a logged-in account.
 
 Treat `cookies.txt` as the account password. Anyone with it can use the account. Never commit it, paste it into a chat, or attach it to an issue. If it leaks, log out of Instagram everywhere and export a new file.
 

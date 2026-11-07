@@ -8,9 +8,6 @@ Usage:
     python ig_download.py urls.txt art --dry-run
     python ig_download.py urls.txt art --retry-failed
 
-Rate-limit protection: consecutive rate-limit responses trigger exponential backoff
-(30s -> 60s -> 120s -> 300s) and the same URL is retried automatically.
-
 Log deduplication: each URL has at most one entry — retries overwrite the previous
 result rather than creating a second entry.
 
@@ -57,14 +54,6 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 _RATE_LIMIT_DELAYS = [30, 60, 120, 300]
-_MAX_CONSECUTIVE_RATE_LIMITS = len(_RATE_LIMIT_DELAYS) + 2
-
-# Instagram sometimes answers a JSON endpoint with an HTML login/consent/challenge
-# page (HTTP 200) when it is throttling. yt-dlp's _parse_json() then raises
-# "Failed to parse JSON (caused by JSONDecodeError(...))". That is a transient
-# throttle/login-wall rather than a broken post, so it is backed off and retried
-# exactly like an explicit rate limit instead of being logged as a hard failure.
-_TRANSIENT_ERROR_CATEGORIES = frozenset({"rate_limited", "parse_error"})
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +280,7 @@ def classify_error(msg):
         return "network_error"
     if _RE_PARSE.search(m):
         # Instagram served HTML where JSON was expected (throttle / consent /
-        # login wall). Treated as transient by _TRANSIENT_ERROR_CATEGORIES.
+        # login wall).
         return "parse_error"
     return "other_error"
 
@@ -1857,7 +1846,7 @@ class DownloadJob:
                     url_file=url_file,
                     collection=prepared["collection"],
                     cookies=prepared["cookies"],
-                    cookies_mode=COOKIES_MODE_ALWAYS,
+                    cookies_mode=COOKIES_MODE_FALLBACK,
                     output_base=prepared["output_dir"],
                     retry_failed=prepared.get("retry_failed", True),
                     filename_template=prepared["filename_template"],
@@ -2828,7 +2817,6 @@ def run_download(
 
     counts = {}
     skipped_disk = 0
-    consecutive_throttle = 0
     cookie_fallbacks = 0
     i = 0
 
@@ -2871,25 +2859,6 @@ def run_download(
                 progress_cb({"type": "cookie_fallback", "url": url, "shortcode": shortcode,
                              "first_error_category": result.get("first_error_category")})
 
-        if result.get("error_category") in _TRANSIENT_ERROR_CATEGORIES:
-            consecutive_throttle += 1
-            if consecutive_throttle >= 5:
-                # 5+ consecutive hits — treat as a real throttle, wait and retry
-                if consecutive_throttle > _MAX_CONSECUTIVE_RATE_LIMITS:
-                    print(f"\n  {consecutive_throttle} consecutive throttled responses - saving progress and aborting.")
-                    if progress_cb:
-                        progress_cb({"type": "rate_limit_abort", "consecutive": consecutive_throttle})
-                    upsert_log_entry(log, result)
-                    save_log(log, log_file)
-                    break
-                ok = _wait_rate_limit(consecutive_throttle, stop_event=stop_event, progress_cb=progress_cb)
-                if not ok:
-                    break
-                continue  # retry same URL
-            # Fewer than 5 consecutive hits — may be unavailable/deleted posts, log and continue
-            print(f"  FAIL [{result.get('error_category')}] ({consecutive_throttle}x, not waiting yet) {result.get('error_detail', '')[:120]}")
-        else:
-            consecutive_throttle = 0
         upsert_log_entry(log, result)
 
         status = result["status"]

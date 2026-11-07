@@ -99,6 +99,30 @@ def test_cookie_policy_fallback_restricted():
     assert res["cookie_fallback"] and res["used_cookies"]
 
 
+def test_parse_errors_do_not_pause_the_download():
+    d = tempfile.mkdtemp(prefix="igdl_nwait_")
+    urlf = os.path.join(d, "urls.txt")
+    with open(urlf, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(f"https://www.instagram.com/p/CODE{i}/" for i in range(6)) + "\n")
+    seen = []
+
+    def fake_download(url, output_dir, cookies, dry_run, filename_template, file_index, cookies_mode="fallback"):
+        seen.append(cookies_mode)
+        return {
+            "url": url, "shortcode": f"CODE{file_index}", "status": "failed",
+            "error_category": "parse_error", "error_detail": "Failed to parse JSON",
+        }
+
+    try:
+        with mock.patch.object(ig, "download_url", side_effect=fake_download), \
+             mock.patch.object(ig, "_wait_rate_limit") as waited:
+            ig.run_download(urlf, "Haircut", cookies="cookies.txt", output_base=d)
+        assert waited.call_count == 0
+        assert seen == ["fallback"] * 6
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def test_cookie_policy_never_for_parse_error():
     calls = []
     with mock.patch.object(ig, "_download_url_once", _fake_once(PARSE, calls)):
@@ -697,6 +721,7 @@ def test_saved_job_writes_urls_then_downloads():
     def fake_run(**kwargs):
         seen["download"] = kwargs["url_file"]
         seen["retry_failed"] = kwargs["retry_failed"]
+        seen["cookies_mode"] = kwargs["cookies_mode"]
         kwargs["progress_cb"]({"type": "done", "summary": {"ok": 1, "failed": 0}})
         return {}
 
@@ -723,6 +748,7 @@ def test_saved_job_writes_urls_then_downloads():
         assert seen["name"] == "Haircut"
         assert seen["download"] == url_file
         assert seen["retry_failed"] is True
+        assert seen["cookies_mode"] == "fallback"
         assert status["events"][-1]["type"] == "done"
     finally:
         shutil.rmtree(d, ignore_errors=True)
