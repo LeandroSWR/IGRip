@@ -612,6 +612,24 @@ def test_gather_post_urls_keeps_posts_that_scroll_away():
     assert seen == [2, 3]
 
 
+def test_gather_does_not_stop_at_a_fixed_post_count():
+    """80 scrolls used to end every long collection on the same count."""
+    class Page:
+        def __init__(self):
+            self.url = "https://www.instagram.com/jane.doe/saved/haircut/1/"
+            self.n = 0
+
+        def evaluate(self, script):
+            self.n += 1
+            return [["p", f"p{min(self.n, 90):04d}"]]
+
+        def wait_for_timeout(self, _ms):
+            return None
+
+    urls = ig._gather_post_urls(Page())
+    assert len(urls) == 90
+
+
 def test_gather_waits_instead_of_stopping_at_the_first_screen():
     class Page:
         def __init__(self):

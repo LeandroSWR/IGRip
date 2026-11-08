@@ -1444,7 +1444,13 @@ def _pairs_from_collect(raw):
     return raw or [], True, False
 
 
-def _gather_post_urls(page, max_steps=80, on_count=None, stop_event=None, progress_cb=None):
+# A desktop grid only reveals a few new posts per scroll. Stopping after 80
+# scrolls ended every long collection at the same count, 384. Finish when the
+# page stops growing instead. The high step count is only a backstop.
+_GATHER_MAX_STEPS = 4000
+
+
+def _gather_post_urls(page, max_steps=_GATHER_MAX_STEPS, on_count=None, stop_event=None, progress_cb=None):
     """Collect post links while scrolling.
 
     Instagram removes links that scroll off screen, so each pass is merged
@@ -1493,18 +1499,18 @@ def _gather_post_urls(page, max_steps=80, on_count=None, stop_event=None, progre
             on_count(count)
         if count == last:
             idle += 1
-            if idle >= 4 and (count > 0 or step >= 6):
+            if idle >= 8 and (count > 0 or step >= 6):
                 break
         else:
             idle = 0
             last = count
-        page.wait_for_timeout(700)
+        page.wait_for_timeout(1000)
     if looks_like_login(page.url, ""):
         raise SavedPageError(_LOGIN_AGAIN, urls)
     return urls
 
 
-def _count_collection_posts(page, max_steps=80):
+def _count_collection_posts(page, max_steps=_GATHER_MAX_STEPS):
     """How many posts are in the collection that is already open."""
     count = len(_gather_post_urls(page, max_steps=max_steps))
     return count or None
